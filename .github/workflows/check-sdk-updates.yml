@@ -74,7 +74,10 @@ jobs:
           fi
 
           # Get latest available versions
-          LATEST_PLATFORM=$(echo "$PACKAGES" | grep 'platforms;android-' | grep -oP 'android-\K\d+' | sort -n | tail -1)
+          # Platform packages now use MAJOR.MINOR versioning (e.g. android-36.1,
+          # android-37.0). Capture the optional minor component and sort by version
+          # so we don't truncate "37.0" to a non-existent "platforms;android-37".
+          LATEST_PLATFORM=$(echo "$PACKAGES" | grep 'platforms;android-' | grep -oP 'android-\K[0-9]+(\.[0-9]+)?' | sort -V | tail -1)
           LATEST_BUILD_TOOLS=$(echo "$PACKAGES" | grep 'build-tools;' | grep -oP 'build-tools;\K[0-9.]+' | sort -V | tail -1)
           LATEST_NDK=$(echo "$PACKAGES" | grep -P '^\s+ndk;' | grep -oP 'ndk;\K[0-9.]+' | sort -V | tail -1)
 
@@ -92,7 +95,10 @@ jobs:
 
           # Check if updates are needed
           UPDATED=false
-          if [ -n "$LATEST_PLATFORM" ] && [ "$LATEST_PLATFORM" != "$CURRENT_PLATFORM" ] && [ "$LATEST_PLATFORM" -gt "$CURRENT_PLATFORM" ] 2>/dev/null; then
+          # Use version-aware comparison (not integer -gt) since platform versions
+          # can be MAJOR.MINOR. Update only when LATEST differs and sorts highest.
+          if [ -n "$LATEST_PLATFORM" ] && [ "$LATEST_PLATFORM" != "$CURRENT_PLATFORM" ] && \
+             [ "$(printf '%s\n%s\n' "$CURRENT_PLATFORM" "$LATEST_PLATFORM" | sort -V | tail -1)" = "$LATEST_PLATFORM" ]; then
             UPDATED=true
           fi
           if [ -n "$LATEST_BUILD_TOOLS" ] && [ "$LATEST_BUILD_TOOLS" != "$CURRENT_BUILD_TOOLS" ]; then
