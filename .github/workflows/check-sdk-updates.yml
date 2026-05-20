@@ -73,11 +73,21 @@ jobs:
             exit 0
           fi
 
-          # Get latest available versions
-          # Platform packages now use MAJOR.MINOR versioning (e.g. android-36.1,
-          # android-37.0). Capture the optional minor component and sort by version
-          # so we don't truncate "37.0" to a non-existent "platforms;android-37".
-          LATEST_PLATFORM=$(echo "$PACKAGES" | grep 'platforms;android-' | grep -oP 'android-\K[0-9]+(\.[0-9]+)?' | sort -V | tail -1)
+          # Get latest available versions.
+          #
+          # Platforms must come from the repository manifest, not `sdkmanager --list`:
+          # preview platforms such as android-37.0 are tagged channel-0 (stable) but
+          # carry a <codename> element, so they appear in --list as if stable yet
+          # require the separate Android SDK Preview license at install time, which
+          # breaks the unattended Docker build. The presence of a <codename> element
+          # is the reliable preview marker, so we parse the manifest and skip any
+          # platform that has one. Versions are MAJOR.MINOR (e.g. 36.1, 37.0).
+          if ! wget -q "https://dl.google.com/android/repository/repository2-3.xml" -O /tmp/android-repo.xml; then
+            echo "Failed to download SDK repository manifest"
+            echo "updated=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          LATEST_PLATFORM=$(perl -0777 -ne 'while(/<remotePackage path="platforms;android-([0-9]+(?:\.[0-9]+)?)">(.*?)<\/remotePackage>/sg){my($v,$b)=($1,$2); next if $b=~/<codename>/; print "$v\n"}' /tmp/android-repo.xml | sort -V | tail -1)
           LATEST_BUILD_TOOLS=$(echo "$PACKAGES" | grep 'build-tools;' | grep -oP 'build-tools;\K[0-9.]+' | sort -V | tail -1)
           LATEST_NDK=$(echo "$PACKAGES" | grep -P '^\s+ndk;' | grep -oP 'ndk;\K[0-9.]+' | sort -V | tail -1)
 
