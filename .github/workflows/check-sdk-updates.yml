@@ -80,14 +80,38 @@ jobs:
           # carry a <codename> element, so they appear in --list as if stable yet
           # require the separate Android SDK Preview license at install time, which
           # breaks the unattended Docker build. The presence of a <codename> element
-          # is the reliable preview marker, so we parse the manifest and skip any
-          # platform that has one. Versions are MAJOR.MINOR (e.g. 36.1, 37.0).
+          # is the reliable preview marker, so we parse the manifest with a real XML
+          # parser and skip any platform that has one. Versions are MAJOR.MINOR
+          # (e.g. 36.1, 37.0).
           if ! wget -q "https://dl.google.com/android/repository/repository2-3.xml" -O /tmp/android-repo.xml; then
             echo "Failed to download SDK repository manifest"
             echo "updated=false" >> $GITHUB_OUTPUT
             exit 0
           fi
-          LATEST_PLATFORM=$(perl -0777 -ne 'while(/<remotePackage path="platforms;android-([0-9]+(?:\.[0-9]+)?)">(.*?)<\/remotePackage>/sg){my($v,$b)=($1,$2); next if $b=~/<codename>/; print "$v\n"}' /tmp/android-repo.xml | sort -V | tail -1)
+          LATEST_PLATFORM=$(python3 - /tmp/android-repo.xml <<'PY'
+          import re, sys, xml.etree.ElementTree as ET
+
+          def local(tag):  # strip XML namespace, if any
+              return tag.rsplit('}', 1)[-1]
+
+          root = ET.parse(sys.argv[1]).getroot()
+          best, best_key = '', None
+          for pkg in root.iter():
+              if local(pkg.tag) != 'remotePackage' or pkg.get('obsolete') == 'true':
+                  continue
+              m = re.fullmatch(r'platforms;android-(\d+(?:\.\d+)?)', pkg.get('path', ''))
+              if not m:
+                  continue
+              # Skip previews: any descendant <codename> element marks a preview.
+              if any(local(e.tag) == 'codename' for e in pkg.iter()):
+                  continue
+              ver = m.group(1)
+              key = tuple(int(x) for x in ver.split('.'))
+              if best_key is None or key > best_key:
+                  best, best_key = ver, key
+          print(best)
+          PY
+          )
           LATEST_BUILD_TOOLS=$(echo "$PACKAGES" | grep 'build-tools;' | grep -oP 'build-tools;\K[0-9.]+' | sort -V | tail -1)
           LATEST_NDK=$(echo "$PACKAGES" | grep -P '^\s+ndk;' | grep -oP 'ndk;\K[0-9.]+' | sort -V | tail -1)
 
