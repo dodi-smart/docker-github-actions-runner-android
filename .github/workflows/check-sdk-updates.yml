@@ -67,7 +67,7 @@ jobs:
             echo "updated=false" >> $GITHUB_OUTPUT
             exit 0
           fi
-          eval "$(python3 - /tmp/android-repo.xml <<'PY'
+          if ! SDK_VERSIONS=$(python3 - /tmp/android-repo.xml <<'PY'
           import re, sys, xml.etree.ElementTree as ET
 
           def local(tag):  # strip XML namespace, if any
@@ -99,11 +99,23 @@ jobs:
                       best, best_key = ver, key
               return best
 
-          print('LATEST_PLATFORM=%s'    % latest(r'platforms;android-(\d+(?:\.\d+)?)'))
-          print('LATEST_BUILD_TOOLS=%s' % latest(r'build-tools;(\d+\.\d+\.\d+)'))
-          print('LATEST_NDK=%s'         % latest(r'ndk;(\d+\.\d+\.\d+)'))
+          platform    = latest(r'platforms;android-(\d+(?:\.\d+)?)')
+          build_tools = latest(r'build-tools;(\d+\.\d+\.\d+)')
+          ndk         = latest(r'ndk;(\d+\.\d+\.\d+)')
+          if not (platform and build_tools and ndk):
+              sys.stderr.write('Failed to detect stable versions: '
+                               'platform=%r build_tools=%r ndk=%r\n' % (platform, build_tools, ndk))
+              sys.exit(1)
+          print('LATEST_PLATFORM=%s'    % platform)
+          print('LATEST_BUILD_TOOLS=%s' % build_tools)
+          print('LATEST_NDK=%s'         % ndk)
           PY
-          )"
+          ); then
+            echo "Failed to parse SDK repository manifest"
+            echo "updated=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          eval "$SDK_VERSIONS"
 
           # Get current versions from Dockerfile
           CURRENT_PLATFORM=$(grep '^ARG COMPILE_SDK=' Dockerfile | cut -d= -f2)
