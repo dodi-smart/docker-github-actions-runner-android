@@ -53,67 +53,69 @@ jobs:
       - name: Check for Android SDK updates
         id: sdk
         run: |
-          # Use SDK_TOOLS version from Dockerfile to download cmdline-tools
-          SDK_TOOLS=$(grep '^ARG SDK_TOOLS=' Dockerfile | cut -d= -f2)
-          if ! wget -q "https://dl.google.com/android/repository/commandlinetools-linux-${SDK_TOOLS}.zip" -O /tmp/cmdline-tools.zip; then
-            echo "Failed to download cmdline-tools"
-            echo "updated=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          unzip -q /tmp/cmdline-tools.zip -d /tmp/android-cmdline
-          SDK_ROOT=/tmp/android-sdk
-          mkdir -p "$SDK_ROOT"
-
-          # List available packages
-          PACKAGES=$(/tmp/android-cmdline/cmdline-tools/bin/sdkmanager --list --sdk_root="$SDK_ROOT" 2>/dev/null || echo "")
-          if [ -z "$PACKAGES" ]; then
-            echo "Failed to list SDK packages"
-            echo "updated=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # Get latest available versions.
-          #
-          # Platforms must come from the repository manifest, not `sdkmanager --list`:
-          # preview platforms such as android-37.0 are tagged channel-0 (stable) but
-          # carry a <codename> element, so they appear in --list as if stable yet
-          # require the separate Android SDK Preview license at install time, which
-          # breaks the unattended Docker build. The presence of a <codename> element
-          # is the reliable preview marker, so we parse the manifest with a real XML
-          # parser and skip any platform that has one. Versions are MAJOR.MINOR
-          # (e.g. 36.1, 37.0).
+          # Determine the latest *stable* SDK versions from Google's repository
+          # manifest. We deliberately do NOT use `sdkmanager --list`: it surfaces
+          # preview packages as if they were stable (the preview platform
+          # android-37.0 is tagged channel-0, and preview NDKs such as 30.0.14904198
+          # are listed too), which then break the unattended Docker build when
+          # sdkmanager demands the separate Android SDK Preview license. The manifest
+          # carries reliable preview markers, so we parse it with a real XML parser
+          # and skip any package that is obsolete, carries a <codename> element, or
+          # uses the android-sdk-preview-license.
           if ! wget -q "https://dl.google.com/android/repository/repository2-3.xml" -O /tmp/android-repo.xml; then
             echo "Failed to download SDK repository manifest"
             echo "updated=false" >> $GITHUB_OUTPUT
             exit 0
           fi
-          LATEST_PLATFORM=$(python3 - /tmp/android-repo.xml <<'PY'
+          if ! SDK_VERSIONS=$(python3 - /tmp/android-repo.xml <<'PY'
           import re, sys, xml.etree.ElementTree as ET
 
           def local(tag):  # strip XML namespace, if any
               return tag.rsplit('}', 1)[-1]
 
           root = ET.parse(sys.argv[1]).getroot()
-          best, best_key = '', None
-          for pkg in root.iter():
-              if local(pkg.tag) != 'remotePackage' or pkg.get('obsolete') == 'true':
-                  continue
-              m = re.fullmatch(r'platforms;android-(\d+(?:\.\d+)?)', pkg.get('path', ''))
-              if not m:
-                  continue
-              # Skip previews: any descendant <codename> element marks a preview.
-              if any(local(e.tag) == 'codename' for e in pkg.iter()):
-                  continue
-              ver = m.group(1)
-              key = tuple(int(x) for x in ver.split('.'))
-              if best_key is None or key > best_key:
-                  best, best_key = ver, key
-          print(best)
+
+          def is_preview(pkg):
+              if pkg.get('obsolete') == 'true':
+                  return True
+              for e in pkg.iter():
+                  if local(e.tag) == 'codename':
+                      return True
+                  if local(e.tag) == 'uses-license' and e.get('ref') == 'android-sdk-preview-license':
+                      return True
+              return False
+
+          def latest(version_re):
+              best, best_key = '', None
+              for pkg in root.iter():
+                  if local(pkg.tag) != 'remotePackage' or is_preview(pkg):
+                      continue
+                  m = re.fullmatch(version_re, pkg.get('path', ''))
+                  if not m:
+                      continue
+                  ver = m.group(1)
+                  key = tuple(int(x) for x in ver.split('.'))
+                  if best_key is None or key > best_key:
+                      best, best_key = ver, key
+              return best
+
+          platform    = latest(r'platforms;android-(\d+(?:\.\d+)?)')
+          build_tools = latest(r'build-tools;(\d+\.\d+\.\d+)')
+          ndk         = latest(r'ndk;(\d+\.\d+\.\d+)')
+          if not (platform and build_tools and ndk):
+              sys.stderr.write('Failed to detect stable versions: '
+                               'platform=%r build_tools=%r ndk=%r\n' % (platform, build_tools, ndk))
+              sys.exit(1)
+          print('LATEST_PLATFORM=%s'    % platform)
+          print('LATEST_BUILD_TOOLS=%s' % build_tools)
+          print('LATEST_NDK=%s'         % ndk)
           PY
-          )
-          LATEST_BUILD_TOOLS=$(echo "$PACKAGES" | grep 'build-tools;' | grep -oP 'build-tools;\K[0-9.]+' | sort -V | tail -1)
-          LATEST_NDK=$(echo "$PACKAGES" | grep -P '^\s+ndk;' | grep -oP 'ndk;\K[0-9.]+' | sort -V | tail -1)
+          ); then
+            echo "Failed to parse SDK repository manifest"
+            echo "updated=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          eval "$SDK_VERSIONS"
 
           # Get current versions from Dockerfile
           CURRENT_PLATFORM=$(grep '^ARG COMPILE_SDK=' Dockerfile | cut -d= -f2)
