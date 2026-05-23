@@ -8,5 +8,10 @@
     "25",
     "26"
   ],
-  "default_jdk": "26"
+  "default_jdk": "26",
+  "node_versions": [
+    "22",
+    "24"
+  ],
+  "default_node": "24"
 }

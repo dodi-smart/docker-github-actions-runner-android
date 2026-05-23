@@ -1,5 +1,6 @@
 ARG VERSION=2.334.0-ubuntu-noble
 ARG JAVA_VERSION=21
+ARG NODE_VERSION=24
 ARG COMPILE_SDK=36.1
 ARG BUILD_TOOLS=37.0.0
 ARG NDK_VERSION=29.0.14206865
@@ -12,6 +13,10 @@ ARG ANDROID_ROOT=/usr/local/lib/android
 ################################################################################
 FROM myoung34/github-runner:$VERSION AS java
 ARG JAVA_VERSION
+ARG NODE_VERSION
+# TARGETARCH is set automatically by Buildx (e.g. amd64, arm64) and matches the
+# arch suffix Temurin uses on its apt-installed JDK directory.
+ARG TARGETARCH
 
 # https://adoptium.net/installation/linux
 # add the gpp key and apt repo
@@ -21,13 +26,20 @@ RUN mkdir -p /etc/apt/keyrings && \
 
 # install the temurin jdk
 RUN apt-get -qq update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends temurin-$JAVA_VERSION-jdk
-ENV JAVA_HOME=/usr/lib/jvm/temurin-$JAVA_VERSION-jdk-amd64
+ENV JAVA_HOME=/usr/lib/jvm/temurin-$JAVA_VERSION-jdk-$TARGETARCH
 
 # install ip tools
 RUN apt-get -qq update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2
 
 # install cmake build-essential
 RUN apt-get -qq update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake build-essential swig
+
+# install nodejs from NodeSource. Replaces the base image's Ubuntu-default node
+# (currently node 18 on noble) with a current LTS that user workflows can rely
+# on without an extra setup-node step.
+RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nodejs \
+  && rm -rf /var/lib/apt/lists/*
 
 ################################################################################
 # - install android sdk

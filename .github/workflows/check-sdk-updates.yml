@@ -1,4 +1,4 @@
-name: Check for SDK and JDK updates
+name: Check for SDK, JDK, and Node updates
 
 on:
   schedule:
@@ -48,6 +48,53 @@ jobs:
           else
             echo "has_new=false" >> $GITHUB_OUTPUT
             echo "No new JDK versions found"
+          fi
+
+      - name: Check for new Node LTS versions
+        id: node
+        run: |
+          # The Node Release team's schedule.json is the authoritative source
+          # for when each major enters LTS and when it goes EOL. We pick majors
+          # that are currently in LTS (today is past their `lts` date and
+          # before their `end` date). dist/index.json is *not* suitable here:
+          # its `lts` field records that a release WAS an LTS at some point,
+          # which falsely includes long-EOL majors (10, 12, 14, 16, 18).
+          if ! SCHEDULE=$(curl -sf https://raw.githubusercontent.com/nodejs/Release/main/schedule.json); then
+            echo "Failed to fetch Node release schedule"
+            echo "has_new=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          TODAY=$(date -u +%Y-%m-%d)
+          AVAILABLE=$(jq -r --arg today "$TODAY" '
+            to_entries
+            | map(select(
+                (.value.lts // null) != null and
+                (.value.end // null) != null and
+                .value.lts <= $today and
+                .value.end > $today))
+            | map(.key | ltrimstr("v") | tonumber)
+            | sort | .[]
+          ' <<< "$SCHEDULE")
+
+          CURRENT=$(jq -r '.node_versions[]' matrix.json)
+          MAX_CURRENT=$(jq -r '.node_versions | map(tonumber) | max' matrix.json)
+
+          # Only add LTS majors newer than our current highest
+          NEW_VERSIONS=""
+          for v in $AVAILABLE; do
+            if [ "$v" -gt "$MAX_CURRENT" ] && ! echo "$CURRENT" | grep -q "^${v}$"; then
+              NEW_VERSIONS="${NEW_VERSIONS:+${NEW_VERSIONS} }${v}"
+            fi
+          done
+
+          echo "new_versions=${NEW_VERSIONS}" >> $GITHUB_OUTPUT
+          if [ -n "$NEW_VERSIONS" ]; then
+            echo "has_new=true" >> $GITHUB_OUTPUT
+            echo "Found new Node LTS versions: $NEW_VERSIONS"
+          else
+            echo "has_new=false" >> $GITHUB_OUTPUT
+            echo "No new Node LTS versions found"
           fi
 
       - name: Check for Android SDK updates
@@ -163,6 +210,20 @@ jobs:
           echo "Updated matrix.json:"
           cat matrix.json
 
+      - name: Apply Node updates
+        if: steps.node.outputs.has_new == 'true'
+        run: |
+          for v in ${{ steps.node.outputs.new_versions }}; do
+            jq --arg v "$v" '.node_versions += [$v] | .node_versions = (.node_versions | sort_by(tonumber))' matrix.json > tmp.json && mv tmp.json matrix.json
+          done
+
+          # Update default_node to highest LTS major (newest LTS line is always
+          # the Active LTS once the latest major enters LTS state).
+          jq '.default_node = (.node_versions | sort_by(tonumber) | last)' matrix.json > tmp.json && mv tmp.json matrix.json
+
+          echo "Updated matrix.json:"
+          cat matrix.json
+
       - name: Apply SDK updates
         if: steps.sdk.outputs.updated == 'true'
         run: |
@@ -175,7 +236,7 @@ jobs:
           [ -n "$LATEST_NDK" ] && sed -i "s/^ARG NDK_VERSION=.*/ARG NDK_VERSION=${LATEST_NDK}/" Dockerfile
 
       - name: Create pull request
-        if: steps.jdk.outputs.has_new == 'true' || steps.sdk.outputs.updated == 'true'
+        if: steps.jdk.outputs.has_new == 'true' || steps.sdk.outputs.updated == 'true' || steps.node.outputs.has_new == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -192,6 +253,9 @@ jobs:
           if [ "${{ steps.jdk.outputs.has_new }}" = "true" ]; then
             MSG="$MSG JDK (${{ steps.jdk.outputs.new_versions }})"
           fi
+          if [ "${{ steps.node.outputs.has_new }}" = "true" ]; then
+            MSG="$MSG Node (${{ steps.node.outputs.new_versions }})"
+          fi
           if [ "${{ steps.sdk.outputs.updated }}" = "true" ]; then
             MSG="$MSG SDK"
           fi
@@ -201,12 +265,19 @@ jobs:
 
           # Build PR body
           {
-            echo "## Automated SDK/JDK version updates"
+            echo "## Automated SDK/JDK/Node version updates"
             echo ""
             if [ "${{ steps.jdk.outputs.has_new }}" = "true" ]; then
               echo "### New JDK versions added to build matrix"
               for v in ${{ steps.jdk.outputs.new_versions }}; do
                 echo "- JDK $v"
+              done
+              echo ""
+            fi
+            if [ "${{ steps.node.outputs.has_new }}" = "true" ]; then
+              echo "### New Node LTS versions added to build matrix"
+              for v in ${{ steps.node.outputs.new_versions }}; do
+                echo "- Node $v"
               done
               echo ""
             fi
@@ -223,14 +294,14 @@ jobs:
               fi
               echo ""
             fi
-            echo "This PR was generated automatically by the weekly SDK/JDK update check."
+            echo "This PR was generated automatically by the weekly SDK/JDK/Node update check."
           } > /tmp/pr-body.txt
 
           # Create PR if one doesn't already exist for this branch
           EXISTING=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null || true)
           if [ -z "$EXISTING" ]; then
             gh pr create \
-              --title "Update SDK/JDK versions" \
+              --title "Update SDK/JDK/Node versions" \
               --body-file /tmp/pr-body.txt \
               --head "$BRANCH"
           else

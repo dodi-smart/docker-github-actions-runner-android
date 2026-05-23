@@ -9,29 +9,36 @@ jobs:
     name: Generate build matrix
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.generate.outputs.matrix }}
+      build_matrix: ${{ steps.generate.outputs.build_matrix }}
+      merge_matrix: ${{ steps.generate.outputs.merge_matrix }}
     steps:
       - uses: actions/checkout@v6
 
-      - name: Generate matrix from matrix.json
+      - name: Generate matrices from matrix.json
         id: generate
         run: |
-          DEFAULT_JDK=$(jq -r '.default_jdk' matrix.json)
-          MATRIX=$(jq -c --arg default "$DEFAULT_JDK" '{
-            "include": [.java_versions[] | {
-              "java_version": .,
-              "is_default_jdk": (. == $default)
-            }]
-          }' matrix.json)
-          echo "matrix=${MATRIX}" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          ALL=$(jq -c '
+            .default_jdk as $dj | .default_node as $dn
+            | [ .java_versions[] as $j | .node_versions[] as $n |
+                { java_version: $j, node_version: $n,
+                  is_default_jdk:  ($j == $dj),
+                  is_default_node: ($n == $dn) } ] as $combos
+            | { build: { include: [
+                  $combos[] as $c |
+                  ($c + {platform: "linux/amd64", arch: "amd64", runner: "ubuntu-latest"}),
+                  ($c + {platform: "linux/arm64", arch: "arm64", runner: "ubuntu-24.04-arm"}) ] },
+                merge: { include: $combos } }' matrix.json)
+          echo "build_matrix=$(jq -c .build  <<< "$ALL")" >> $GITHUB_OUTPUT
+          echo "merge_matrix=$(jq -c .merge <<< "$ALL")" >> $GITHUB_OUTPUT
 
-  deploy:
-    name: Build JDK ${{ matrix.java_version }}
+  build:
+    name: Build ${{ matrix.platform }} JDK ${{ matrix.java_version }} Node ${{ matrix.node_version }}
     needs: matrix
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.matrix.outputs.build_matrix) }}
     steps:
       - uses: actions/checkout@v6
 
@@ -68,6 +75,84 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ steps.versions.outputs.runner_tag }}
+            JAVA_VERSION=${{ matrix.java_version }}
+            NODE_VERSION=${{ matrix.node_version }}
+          outputs: |
+            type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/github-runner-android,push-by-digest=true,name-canonical=true,push=true
+            type=image,name=ghcr.io/${{ github.repository_owner }}/github-runner-android,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-jdk${{ matrix.java_version }}-node${{ matrix.node_version }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge JDK ${{ matrix.java_version }} Node ${{ matrix.node_version }}
+    needs: [matrix, build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.matrix.outputs.merge_matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Extract versions from Dockerfile
+        id: versions
+        run: |
+          set -euo pipefail
+          RUNNER_TAG=$(grep -m1 '^ARG VERSION=' Dockerfile | cut -d= -f2)
+          RUNNER_VERSION=$(echo "$RUNNER_TAG" | cut -d- -f1)
+          COMPILE_SDK=$(grep -m1 '^ARG COMPILE_SDK=' Dockerfile | cut -d= -f2)
+
+          if [ -z "$RUNNER_TAG" ] || [ -z "$RUNNER_VERSION" ] || [ -z "$COMPILE_SDK" ]; then
+            echo "::error::Failed to extract versions from Dockerfile"
+            exit 1
+          fi
+
+          echo "runner_version=${RUNNER_VERSION}" >> $GITHUB_OUTPUT
+          echo "compile_sdk=${COMPILE_SDK}" >> $GITHUB_OUTPUT
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-jdk${{ matrix.java_version }}-node${{ matrix.node_version }}-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v6
@@ -76,17 +161,27 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/github-runner-android
             ghcr.io/${{ github.repository_owner }}/github-runner-android
           tags: |
-            type=raw,value=jdk${{ matrix.java_version }}
-            type=raw,value=${{ steps.versions.outputs.runner_version }}-jdk${{ matrix.java_version }}-sdk${{ steps.versions.outputs.compile_sdk }}
-            type=raw,value=latest,enable=${{ matrix.is_default_jdk }}
+            type=raw,value=jdk${{ matrix.java_version }},enable=${{ matrix.is_default_node }}
+            type=raw,value=node${{ matrix.node_version }},enable=${{ matrix.is_default_jdk }}
+            type=raw,value=jdk${{ matrix.java_version }}-node${{ matrix.node_version }}
+            type=raw,value=${{ steps.versions.outputs.runner_version }}-jdk${{ matrix.java_version }}-sdk${{ steps.versions.outputs.compile_sdk }}-node${{ matrix.node_version }}
+            type=raw,value=latest,enable=${{ matrix.is_default_jdk && matrix.is_default_node }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: true
-          build-args: |
-            VERSION=${{ steps.versions.outputs.runner_tag }}
-            JAVA_VERSION=${{ matrix.java_version }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/github-runner-android
+        run: |
+          set -euo pipefail
+          # -t flags: every tag computed by metadata-action (covers both registries)
+          TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          # Source references: one per arch, pulled by digest. Both registries
+          # already hold the per-arch blob from the build job, so referencing
+          # either registry works — buildx pushes the assembled manifest list
+          # to every -t target independently.
+          SOURCES=$(printf "${DOCKERHUB_IMAGE}@sha256:%s " *)
+          docker buildx imagetools create $TAGS $SOURCES
+
+          for tag in $(jq -cr '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON"); do
+            docker buildx imagetools inspect "$tag"
+          done
