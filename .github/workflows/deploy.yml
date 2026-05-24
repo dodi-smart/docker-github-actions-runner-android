@@ -83,7 +83,7 @@ jobs:
             VERSION=${{ steps.versions.outputs.runner_tag }}
             JAVA_VERSION=${{ matrix.java_version }}
             NODE_VERSION=${{ matrix.node_version }}
-          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/github-runner-android,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/github-runner,push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
         run: |
@@ -147,7 +147,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository_owner }}/github-runner-android
+          images: ghcr.io/${{ github.repository_owner }}/github-runner
           tags: |
             type=raw,value=jdk${{ matrix.java_version }},enable=${{ matrix.is_default_node }}
             type=raw,value=node${{ matrix.node_version }},enable=${{ matrix.is_default_jdk }}
@@ -158,7 +158,7 @@ jobs:
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/github-runner-android
+          IMAGE: ghcr.io/${{ github.repository_owner }}/github-runner
         run: |
           set -euo pipefail
           TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")

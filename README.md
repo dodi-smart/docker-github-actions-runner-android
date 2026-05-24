@@ -23,7 +23,7 @@ variables.
 ## Image tags
 
 Images are published to GitHub Container Registry (GHCR):
-- `ghcr.io/dodi-smart/github-runner-android`
+- `ghcr.io/dodi-smart/github-runner`
 
 ### Tag scheme
 
