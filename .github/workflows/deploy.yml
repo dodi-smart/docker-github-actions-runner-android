@@ -79,6 +79,12 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          # Disable SLSA provenance: it wraps the image in a per-registry
+          # attestation index which produces unknown/unknown manifest entries
+          # and an extra attestation manifest per arch. Nothing in this
+          # pipeline consumes the provenance, and turning it off keeps the
+          # registry view to just amd64 + arm64.
+          provenance: false
           build-args: |
             VERSION=${{ steps.versions.outputs.runner_tag }}
             JAVA_VERSION=${{ matrix.java_version }}
