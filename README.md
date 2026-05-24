@@ -22,9 +22,8 @@ variables.
 
 ## Image tags
 
-Images are published to both Docker Hub and GitHub Container Registry (GHCR):
-- `compscidr/github-runner-android`
-- `ghcr.io/compscidr/github-runner-android`
+Images are published to GitHub Container Registry (GHCR):
+- `ghcr.io/dodi-smart/github-runner-android`
 
 ### Tag scheme
 
