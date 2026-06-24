@@ -16,7 +16,7 @@ jobs:
       build_matrix: ${{ steps.generate.outputs.build_matrix }}
       merge_matrix: ${{ steps.generate.outputs.merge_matrix }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Generate matrices from matrix.json
         id: generate
@@ -44,7 +44,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.matrix.outputs.build_matrix) }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Extract versions from Dockerfile
         id: versions
@@ -114,7 +114,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.matrix.outputs.merge_matrix) }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Extract versions from Dockerfile
         id: versions
