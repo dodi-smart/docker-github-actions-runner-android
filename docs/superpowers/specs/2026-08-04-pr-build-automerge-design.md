@@ -35,7 +35,7 @@ and unmerged, and nothing deploys.
     from the Dockerfile's ARG default, so a broken value still fails the
     build.)
   - `fail-fast: false` so every broken JDK variant is visible.
-- **Concurrency:** group keyed on the PR ref with `cancel-in-progress: true`
+- **Concurrency:** group keyed on the PR number with `cancel-in-progress: true`
   so superseded runs are cancelled.
 - **Gate job:** a final job named **"All builds passed"** with `if: always()`
   and `needs: [matrix, build]` that fails unless every needed job succeeded.
