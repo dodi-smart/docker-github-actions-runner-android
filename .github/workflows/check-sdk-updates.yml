@@ -6,8 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   check-updates:
@@ -20,6 +19,11 @@ jobs:
         run: |
           if [ -z "$AUTOMERGE_PAT" ]; then
             echo "::error::AUTOMERGE_PAT secret is not configured. Create a fine-grained PAT scoped to this repo with contents:write and pull-requests:write, and save it as a repository secret named AUTOMERGE_PAT. PRs created with the default GITHUB_TOKEN never trigger the build workflow, so they could never auto-merge."
+            exit 1
+          fi
+
+          if ! GH_TOKEN="$AUTOMERGE_PAT" gh api user --silent; then
+            echo "::error::AUTOMERGE_PAT is invalid or expired. Generate a new fine-grained PAT (contents: write, pull-requests: write, this repo only) and update the AUTOMERGE_PAT repository secret."
             exit 1
           fi
 
