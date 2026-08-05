@@ -1,0 +1,77 @@
+name: Build container (PR)
+on:
+  pull_request:
+
+concurrency:
+  group: build-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    name: Generate build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Generate matrix from matrix.json
+        id: generate
+        run: |
+          DEFAULT_JDK=$(jq -r '.default_jdk' matrix.json)
+          MATRIX=$(jq -c --arg default "$DEFAULT_JDK" '{
+            "include": [.java_versions[] | {
+              "java_version": .,
+              "is_default_jdk": (. == $default)
+            }]
+          }' matrix.json)
+          echo "matrix=${MATRIX}" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build JDK ${{ matrix.java_version }}
+    needs: matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Extract versions from Dockerfile
+        id: versions
+        run: |
+          set -euo pipefail
+          RUNNER_TAG=$(grep -m1 '^ARG VERSION=' Dockerfile | cut -d= -f2)
+
+          if [ -z "$RUNNER_TAG" ]; then
+            echo "::error::Failed to extract versions from Dockerfile"
+            exit 1
+          fi
+
+          echo "runner_tag=${RUNNER_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          build-args: |
+            VERSION=${{ steps.versions.outputs.runner_tag }}
+            JAVA_VERSION=${{ matrix.java_version }}
+
+  gate:
+    name: All builds passed
+    needs: [matrix, build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check that all required jobs succeeded
+        run: |
+          if [ "${{ needs.matrix.result }}" != "success" ] || [ "${{ needs.build.result }}" != "success" ]; then
+            echo "::error::A required job failed or was cancelled (matrix: ${{ needs.matrix.result }}, build: ${{ needs.build.result }})"
+            exit 1
+          fi
+          echo "All builds succeeded"
