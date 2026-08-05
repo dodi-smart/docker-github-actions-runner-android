@@ -14,7 +14,18 @@ jobs:
     name: Check for updates
     runs-on: ubuntu-latest
     steps:
+      - name: Verify AUTOMERGE_PAT is configured
+        env:
+          AUTOMERGE_PAT: ${{ secrets.AUTOMERGE_PAT }}
+        run: |
+          if [ -z "$AUTOMERGE_PAT" ]; then
+            echo "::error::AUTOMERGE_PAT secret is not configured. Create a fine-grained PAT scoped to this repo with contents:write and pull-requests:write, and save it as a repository secret named AUTOMERGE_PAT. PRs created with the default GITHUB_TOKEN never trigger the build workflow, so they could never auto-merge."
+            exit 1
+          fi
+
       - uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.AUTOMERGE_PAT }}
 
       - name: Check for new JDK versions
         id: jdk
@@ -177,7 +188,7 @@ jobs:
       - name: Create pull request
         if: steps.jdk.outputs.has_new == 'true' || steps.sdk.outputs.updated == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.AUTOMERGE_PAT }}
         run: |
           BRANCH="automated/sdk-jdk-updates"
 
@@ -236,3 +247,7 @@ jobs:
           else
             echo "PR #${EXISTING} already exists, updated with force push"
           fi
+
+          # Enable auto-merge so the PR merges once "All builds passed" succeeds.
+          # Runs for both new and force-updated existing PRs; idempotent.
+          gh pr merge --auto --merge "$BRANCH"
