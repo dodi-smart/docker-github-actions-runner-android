@@ -27,9 +27,13 @@ and unmerged, and nothing deploys.
   report on every PR or merges block forever).
 - **Structure:** mirrors deploy.yml:
   - `matrix` job: generates the JDK matrix from `matrix.json` (same jq logic).
-  - `build` job: per-JDK; extracts `VERSION` / `COMPILE_SDK` from the
-    Dockerfile, sets up Buildx, runs `docker/build-push-action` with
-    `push: false`, same `build-args` as deploy. No registry logins.
+  - `build` job: per-JDK; extracts `VERSION` from the Dockerfile, sets up
+    Buildx, runs `docker/build-push-action` with `push: false`, same
+    `build-args` as deploy. No registry logins. (`COMPILE_SDK` is not
+    extracted: deploy.yml only needs it to compose image tags, and the PR
+    build produces no tags — the Docker build itself consumes `COMPILE_SDK`
+    from the Dockerfile's ARG default, so a broken value still fails the
+    build.)
   - `fail-fast: false` so every broken JDK variant is visible.
 - **Concurrency:** group keyed on the PR ref with `cancel-in-progress: true`
   so superseded runs are cancelled.
