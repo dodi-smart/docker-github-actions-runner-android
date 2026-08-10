@@ -70,8 +70,11 @@ preflight() {
       ;;
   esac
 
+  # Bounded timeouts so a DNS/TLS/network stall can't block runner startup;
+  # a timeout falls into the default case below and leaves the config as-is.
   local status
   status=$(curl -sS -o /dev/null -w '%{http_code}' \
+    --connect-timeout 5 --max-time 15 \
     -H "Authorization: token ${ACCESS_TOKEN}" \
     -H "Accept: application/vnd.github+json" \
     "${api_base}/${api_path}" 2>/dev/null)
