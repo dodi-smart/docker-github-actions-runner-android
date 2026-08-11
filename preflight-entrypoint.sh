@@ -21,9 +21,33 @@
 
 log() { echo "[preflight] $*"; }
 
+# The runner's IsConfigured()/HasCredentials() checks treat .runner_migrated /
+# .credentials_migrated as equivalent to the primary files, so a wipe must
+# remove all five or config.sh refuses to re-register while run.sh can't load
+# settings ("Value cannot be null. (Parameter 'configuredSettings')") — a
+# crash loop that never self-heals. The files are removed from /actions-runner
+# too: the writable layer survives restarts, and the upstream entrypoint's
+# persist-back step otherwise re-seeds the persist dir from it.
+wipe_registration() {
+  local dir="$1" f
+  for f in .runner .credentials .credentials_rsaparams .runner_migrated .credentials_migrated; do
+    rm -f "$dir/$f" "/actions-runner/$f"
+  done
+}
+
 preflight() {
   local dir="${CONFIGURED_ACTIONS_RUNNER_FILES_DIR:-}"
   [ -n "$dir" ] || return 0
+
+  # Heal the wedged state left behind by a partial wipe (an older preflight or
+  # manual cleanup that removed .runner but not .runner_migrated): without
+  # .runner there is nothing to validate, and the orphaned migrated files
+  # alone block registration.
+  if [ ! -f "$dir/.runner" ] && [ -f "$dir/.runner_migrated" ]; then
+    log "orphaned .runner_migrated without .runner; removing it so registration can proceed"
+    wipe_registration "$dir"
+  fi
+
   [ -f "$dir/.runner" ] || return 0
   if [ -z "${ACCESS_TOKEN:-}" ]; then
     log "ACCESS_TOKEN not set; cannot validate persisted registration, leaving as-is"
@@ -86,7 +110,7 @@ preflight() {
     404)
       log "persisted runner agentId=${agent_id} no longer exists on ${github_host};" \
         "wiping persisted registration to force fresh ACCESS_TOKEN registration"
-      rm -f "$dir/.runner" "$dir/.credentials" "$dir/.credentials_rsaparams"
+      wipe_registration "$dir"
       ;;
     *)
       log "could not validate persisted runner (HTTP ${status:-none}); leaving as-is"
