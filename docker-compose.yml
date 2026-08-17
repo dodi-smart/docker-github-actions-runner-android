@@ -4,7 +4,7 @@ services:
       context: .
     # if you don't want to build and instead just use the pre-built image
     # comment out the build block above and uncomment below
-    # image: compscidr/github-runner-android
+    # image: ghcr.io/dodi-smart/github-runner
     container_name: gha
     env_file:
       - .env

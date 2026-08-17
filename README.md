@@ -89,12 +89,40 @@ Versions are kept up to date automatically:
 | Component | Mechanism |
 |-----------|-----------|
 | Base runner image | [Renovate](https://github.com/renovatebot/renovate) tracks `myoung34/github-runner` Docker tags |
-| GitHub Actions versions | Renovate (`config:base`) |
+| GitHub Actions versions | Renovate (`config:recommended`) |
 | New JDK major versions | Weekly workflow queries the [Adoptium API](https://api.adoptium.net) and opens a PR |
 | New Node LTS majors | Weekly workflow queries the [Node Release schedule](https://github.com/nodejs/Release/blob/main/schedule.json) and opens a PR |
 | Android SDK platform level | Weekly workflow queries `sdkmanager` and opens a PR |
 | Android build-tools | Weekly workflow queries `sdkmanager` and opens a PR |
 | Android NDK | Weekly workflow queries `sdkmanager` and opens a PR |
+
+Every pull request is validated by [`build.yml`](.github/workflows/build.yml),
+which builds each JDK against the default Node, each Node against the default
+JDK, and one `linux/arm64` build of the default pair. Its `All builds passed`
+job is the single check to require in branch protection.
+
+Because this repository is a fork, `renovate.json` sets
+`"forkProcessing": "enabled"`. The Mend-hosted Renovate App leaves fork
+processing disabled for org-wide ("All repositories") installations, so without
+that flag Renovate silently skips the repository and the base image is never
+bumped.
+
+The weekly SDK/JDK/Node workflow opens its PR with `GITHUB_TOKEN`, which means
+GitHub does not run `build.yml` on it. Upstream solves this with an
+`AUTOMERGE_PAT` secret and `gh pr merge --auto`; this fork does not, so those
+PRs are merged manually and the builds run on merge.
+
+## Runner registration preflight
+
+The image wraps the base entrypoint with
+[`preflight-entrypoint.sh`](preflight-entrypoint.sh). When
+`CONFIGURED_ACTIONS_RUNNER_FILES_DIR` is set, the upstream entrypoint reuses
+persisted registration credentials without checking them, so a runner that was
+removed on GitHub's side crash-loops forever instead of re-registering. The
+preflight asks GitHub whether the persisted runner still exists and wipes the
+stored registration only on a definitive `404`, letting a fresh `ACCESS_TOKEN`
+registration take over. Timeouts, missing variables, and unparseable state all
+leave the configuration untouched.
 
 ## Building locally
 
