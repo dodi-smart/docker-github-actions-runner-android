@@ -1,4 +1,4 @@
-ARG VERSION=2.335.1-ubuntu-noble
+ARG VERSION=2.336.0-ubuntu-noble
 ARG JAVA_VERSION=21
 ARG NODE_VERSION=24
 ARG COMPILE_SDK=36.1
@@ -83,6 +83,17 @@ COPY cleanup.sh /usr/local/bin/cleanup.sh
 RUN chmod +x /usr/local/bin/cleanup.sh
 ENV ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/cleanup.sh
 
-# NB: there is no CMD so it will work the same as the base image. See the
+# Preflight entrypoint: validates the persisted runner registration against
+# GitHub before handing off to the upstream entrypoint. Upstream reuses
+# CONFIGURED_ACTIONS_RUNNER_FILES_DIR credentials unconditionally, which
+# crash-loops the container when the runner was removed server-side; the
+# preflight wipes provably-dead registrations so a fresh ACCESS_TOKEN
+# registration happens instead. See preflight-entrypoint.sh for details.
+COPY preflight-entrypoint.sh /usr/local/bin/preflight-entrypoint.sh
+RUN chmod +x /usr/local/bin/preflight-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/preflight-entrypoint.sh"]
+# Declaring ENTRYPOINT resets the CMD inherited from the base image, so the
+# base image's CMD is restated here. See
 # https://github.com/myoung34/docker-github-actions-runner#environment-variables
 # for how to use the image
+CMD ["./bin/Runner.Listener", "run", "--startuptype", "service"]

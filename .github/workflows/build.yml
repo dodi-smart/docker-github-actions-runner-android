@@ -1,0 +1,94 @@
+name: Build container (PR)
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    name: Generate build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Generate matrix from matrix.json
+        id: generate
+        run: |
+          set -euo pipefail
+          # PR builds deliberately cover less than deploy.yml: the full
+          # java x node x arch product is ~28 images, which is far more than a
+          # dependency bump needs. Instead we cover every JDK against the
+          # default Node, every Node against the default JDK, and add a single
+          # arm64 build of the default pair so arch-specific breakage (e.g. the
+          # TARGETARCH-derived JAVA_HOME) is still caught before merge.
+          MATRIX=$(jq -c '
+            .default_jdk as $dj | .default_node as $dn
+            | ( [ .java_versions[] | {java_version: ., node_version: $dn} ]
+                + [ .node_versions[] | {java_version: $dj, node_version: .} ]
+                | unique ) as $combos
+            | { include:
+                ( [ $combos[] | . + {platform: "linux/amd64", arch: "amd64", runner: "ubuntu-latest"} ]
+                  + [ {java_version: $dj, node_version: $dn,
+                       platform: "linux/arm64", arch: "arm64", runner: "ubuntu-24.04-arm"} ] ) }' matrix.json)
+          echo "matrix=${MATRIX}" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build ${{ matrix.arch }} JDK ${{ matrix.java_version }} Node ${{ matrix.node_version }}
+    needs: matrix
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Extract versions from Dockerfile
+        id: versions
+        run: |
+          set -euo pipefail
+          # Only VERSION is extracted here: JDK and Node come from the matrix,
+          # and the SDK args are consumed straight from the Dockerfile defaults
+          # since nothing in a PR build needs them for tagging.
+          RUNNER_TAG=$(grep -m1 '^ARG VERSION=' Dockerfile | cut -d= -f2)
+
+          if [ -z "$RUNNER_TAG" ]; then
+            echo "::error::Failed to extract versions from Dockerfile"
+            exit 1
+          fi
+
+          echo "runner_tag=${RUNNER_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: false
+          build-args: |
+            VERSION=${{ steps.versions.outputs.runner_tag }}
+            JAVA_VERSION=${{ matrix.java_version }}
+            NODE_VERSION=${{ matrix.node_version }}
+
+  gate:
+    name: All builds passed
+    needs: [matrix, build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check that all required jobs succeeded
+        run: |
+          if [ "${{ needs.matrix.result }}" != "success" ] || [ "${{ needs.build.result }}" != "success" ]; then
+            echo "::error::A required job failed or was cancelled (matrix: ${{ needs.matrix.result }}, build: ${{ needs.build.result }})"
+            exit 1
+          fi
+          echo "All builds succeeded"

@@ -307,3 +307,9 @@ jobs:
           else
             echo "PR #${EXISTING} already exists, updated with force push"
           fi
+
+          # No auto-merge on purpose: this PR is opened with GITHUB_TOKEN, and GitHub
+          # does not trigger workflows for PRs created that way. build.yml never runs,
+          # so the "All builds passed" check never reports and an auto-merge request
+          # would hang forever. Merge manually (which runs the builds), or add a
+          # fine-grained PAT and restore upstream's auto-merge step.
