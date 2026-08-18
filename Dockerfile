@@ -78,9 +78,12 @@ ENV ANDROID_SDK_ROOT=$ANDROID_ROOT/sdk
 ENV ANDROID_HOME=$ANDROID_ROOT/sdk
 LABEL maintainer="ernstjason1@gmail.com"
 
-# Post-job cleanup hook to prevent unbounded cache growth
+# Job hooks: JOB_STARTED is the poison sweep (covers OOM / killed runner);
+# JOB_COMPLETED is the tidy-up. Neither wipes package / Gradle caches.
+COPY pre-job.sh /usr/local/bin/pre-job.sh
 COPY cleanup.sh /usr/local/bin/cleanup.sh
-RUN chmod +x /usr/local/bin/cleanup.sh
+RUN chmod +x /usr/local/bin/pre-job.sh /usr/local/bin/cleanup.sh
+ENV ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/pre-job.sh
 ENV ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/cleanup.sh
 
 # Preflight entrypoint: validates the persisted runner registration against

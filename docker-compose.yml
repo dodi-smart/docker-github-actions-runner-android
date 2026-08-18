@@ -1,16 +1,75 @@
+# Beelink X64 layout: three persistent runners, each with its own work and
+# cache volumes. Do not share bun/gradle/npm/cargo volumes across services —
+# concurrent jobs would corrupt the same tree. YAML merge of volumes:
+# replaces the list, so docker.sock is repeated on each service.
+x-runner: &runner
+  image: ghcr.io/dodi-smart/github-runner
+  restart: unless-stopped
+  environment:
+    APP_ID: ${APP_ID}
+    APP_PRIVATE_KEY: ${APP_PRIVATE_KEY}
+    APP_LOGIN: ${APP_LOGIN}
+    RUNNER_NAME_PREFIX: ${RUNNER_NAME_PREFIX:-runner}
+    RUNNER_WORKDIR: /tmp/runner/work
+    RUNNER_SCOPE: org
+    ORG_NAME: ${APP_LOGIN}
+    LABELS: ${LABELS:-self-hosted,Linux,X64,beelink,docker,large}
+    RUNNER_GROUP: ${RUNNER_GROUP:-Default}
+    DISABLE_AUTO_UPDATE: ${DISABLE_AUTO_UPDATE:-false}
+    EPHEMERAL: "false"
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+  security_opt:
+    - label:disable
+
 services:
-  gha:
-    build:
-      context: .
-    # if you don't want to build and instead just use the pre-built image
-    # comment out the build block above and uncomment below
-    # image: ghcr.io/dodi-smart/github-runner
-    container_name: gha
-    env_file:
-      - .env
-    restart: always
-    # uncomment below for interactive debugging, this will override the normal entrypoint and prevent
-    # gh actions runner from starting up, but is good for debugging path issues, etc.
-#    entrypoint: /bin/bash
-#    tty: true
-#    stdin_open: true
+  runner:
+    <<: *runner
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner-work:/tmp/runner/work
+      - runner-bun:/root/.bun
+      - runner-npm:/root/.npm
+      - runner-pnpm:/root/.cache/pnpm
+      - runner-gradle:/root/.gradle
+      - runner-cargo:/root/.cargo
+  runner-2:
+    <<: *runner
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner-work-2:/tmp/runner/work
+      - runner-bun-2:/root/.bun
+      - runner-npm-2:/root/.npm
+      - runner-pnpm-2:/root/.cache/pnpm
+      - runner-gradle-2:/root/.gradle
+      - runner-cargo-2:/root/.cargo
+  runner-3:
+    <<: *runner
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner-work-3:/tmp/runner/work
+      - runner-bun-3:/root/.bun
+      - runner-npm-3:/root/.npm
+      - runner-pnpm-3:/root/.cache/pnpm
+      - runner-gradle-3:/root/.gradle
+      - runner-cargo-3:/root/.cargo
+
+volumes:
+  runner-work: {}
+  runner-work-2: {}
+  runner-work-3: {}
+  runner-bun: {}
+  runner-bun-2: {}
+  runner-bun-3: {}
+  runner-npm: {}
+  runner-npm-2: {}
+  runner-npm-3: {}
+  runner-pnpm: {}
+  runner-pnpm-2: {}
+  runner-pnpm-3: {}
+  runner-gradle: {}
+  runner-gradle-2: {}
+  runner-gradle-3: {}
+  runner-cargo: {}
+  runner-cargo-2: {}
+  runner-cargo-3: {}
