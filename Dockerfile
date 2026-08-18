@@ -76,7 +76,7 @@ ENV PATH="${PATH}:/usr/local/lib/android/sdk/platform-tools/"
 # ANDROID_HOME is deprecated, but older versions of Gradle rely on it
 ENV ANDROID_SDK_ROOT=$ANDROID_ROOT/sdk
 ENV ANDROID_HOME=$ANDROID_ROOT/sdk
-LABEL maintainer="ernstjason1@gmail.com"
+LABEL maintainer="asen.lekov@dodi.li"
 
 # Job hooks: JOB_STARTED is the poison sweep (covers OOM / killed runner);
 # JOB_COMPLETED is the tidy-up. Neither wipes package / Gradle caches.
