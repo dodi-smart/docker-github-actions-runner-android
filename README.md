@@ -17,8 +17,55 @@ Linux hosts run natively without emulation.
 To run the container, check out the environment variables from the base image:
 https://github.com/myoung34/docker-github-actions-runner#environment-variables
 
-There is also an example docker-compose file which uses .env file to set the
-variables.
+[`docker-compose.yml`](docker-compose.yml) is the X64 beelink layout — three
+persistent runners, each with its own work **and** cache volumes — not a
+side file. After pulling a new image on the host:
+
+```
+docker compose pull && docker compose up -d
+```
+
+Existing named `runner-work*` volumes keep their data; new cache volumes
+start empty and warm on first jobs. Do not share one bun/gradle volume
+across the three containers: concurrent jobs would corrupt the same tree.
+
+## X64 cache volumes
+
+This compose is for the **X64** class (`beelink`, `docker`, `large`). System
+labels (`Linux`, `X64`) are still applied by the runner binary; set
+`LABELS` in `.env` to `beelink,docker,large` (do not add a `build` label).
+`EPHEMERAL` stays `false` so the volumes survive between jobs.
+
+Each runner gets its own:
+
+| Mount | Volume (runner / runner-2 / runner-3) | Why |
+|-------|----------------------------------------|-----|
+| `/tmp/runner/work` | `runner-work*` | Job workspace. Cleanup spares `$RUNNER_WORKDIR`. |
+| `/root/.bun` | `runner-bun*` | Bun install cache |
+| `/root/.npm` | `runner-npm*` | npm cache |
+| `/root/.cache/pnpm` | `runner-pnpm*` | pnpm store |
+| `/root/.gradle` | `runner-gradle*` | Gradle modules, build-cache, transforms |
+| `/root/.cargo` | `runner-cargo*` | Cargo registry |
+
+Budget ~20 GB per runner (enforced by the post-job hook with LRU, not a
+wipe), ~60 GB per beelink. ARM64 / Pi hosts should **not** mount these
+cache volumes — those runners isolate to `RUNNER_TEMP`.
+
+Do **not** tmpfs `/tmp`. `RUNNER_WORKDIR` is `/tmp/runner/work`; a tmpfs
+or a blanket `find /tmp -delete` hides or wipes the work volume.
+
+### Workflows must use the volume homes
+
+Named volumes are unused if the job relocates the caches. On these X64
+self-hosted runners, workflows must **not** isolate `GRADLE_USER_HOME` or
+`BUN_INSTALL_CACHE_DIR` (or `npm_config_cache` / `CARGO_HOME`) to
+`$RUNNER_TEMP`. That is the `setup-stack` local-home mode in
+`dodi-smart/.github` — `deps-verify` stays isolated; `pr-checks` uses the
+default homes so the volumes are actually read.
+
+The other half of cache poison is GitHub `actions/cache` with
+`restore-keys` re-importing a partial bun tarball. Use an exact key, or
+do not upload the bun install cache at all.
 
 ## Image tags
 
