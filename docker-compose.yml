@@ -1,30 +1,78 @@
-# Beelink X64 layout: three persistent runners, each with its own work and
-# cache volumes. Do not share bun/gradle/npm/cargo volumes across services —
-# concurrent jobs would corrupt the same tree. YAML merge of volumes:
-# replaces the list, so docker.sock is repeated on each service.
+# Coolify service: three persistent X64 runners in one stack.
+#
+# Deploy this file as a single Coolify resource (Service, or an Application
+# using the Docker Compose build pack). Coolify surfaces every ${VAR} below in
+# the resource's Environment Variables tab:
+#
+#   ${VAR:?}         required - Coolify blocks the deploy while it is empty
+#   ${VAR:-default}  optional - editable, pre-filled with the default
+#   VAR: "value"     hardcoded - not shown in the UI, not editable
+#
+# Coolify's SERVICE_FQDN_* / SERVICE_URL_* / SERVICE_PASSWORD_* magic variables
+# are deliberately unused: the runners publish no port, need no domain, and
+# their only secret is the GitHub App key you supply. If you ever run this
+# stack on two hosts against the same org, give each host a different
+# RUNNER_NAME_PREFIX rather than generating one - the runner names are meant
+# to be readable in the GitHub UI.
+#
+# Coolify prefixes the named volumes with the resource UUID, so each runner
+# keeps its own work and cache tree and two stacks on one host never collide.
+# Do not share bun/gradle/npm/cargo volumes across services - concurrent jobs
+# would corrupt the same tree. YAML merge of volumes: replaces the list, so
+# docker.sock is repeated on each service.
+x-runner-env: &runner-env
+  APP_ID: ${APP_ID:?}
+  # Paste the PEM as-is (multi-line is fine in Coolify) or with literal \n.
+  APP_PRIVATE_KEY: ${APP_PRIVATE_KEY:?}
+  APP_LOGIN: ${APP_LOGIN:?}
+  RUNNER_SCOPE: org
+  ORG_NAME: ${APP_LOGIN:?}
+  RUNNER_WORKDIR: /tmp/runner/work
+  LABELS: ${LABELS:-self-hosted,Linux,X64,beelink,docker,large}
+  RUNNER_GROUP: ${RUNNER_GROUP:-Default}
+  # The upstream entrypoint tests these with `[ -n ... ]`, so ANY non-empty
+  # value enables the flag - "false" enables it too. DISABLE_AUTO_UPDATE is
+  # hardcoded (and hidden from the Coolify UI) because a self-updating runner
+  # writes into the container layer and loses the update on the next redeploy.
+  # EPHEMERAL is omitted for the same reason: setting it to "false" would pass
+  # --ephemeral and tear the runner down after every job.
+  DISABLE_AUTO_UPDATE: "true"
+
 x-runner: &runner
-  image: ghcr.io/dodi-smart/github-runner
+  image: ghcr.io/dodi-smart/github-runner:latest
+  pull_policy: always
   restart: unless-stopped
-  environment:
-    APP_ID: ${APP_ID}
-    APP_PRIVATE_KEY: ${APP_PRIVATE_KEY}
-    APP_LOGIN: ${APP_LOGIN}
-    RUNNER_NAME_PREFIX: ${RUNNER_NAME_PREFIX:-runner}
-    RUNNER_WORKDIR: /tmp/runner/work
-    RUNNER_SCOPE: org
-    ORG_NAME: ${APP_LOGIN}
-    LABELS: ${LABELS:-self-hosted,Linux,X64,beelink,docker,large}
-    RUNNER_GROUP: ${RUNNER_GROUP:-Default}
-    DISABLE_AUTO_UPDATE: ${DISABLE_AUTO_UPDATE:-false}
-    EPHEMERAL: "false"
-  volumes:
-    - /var/run/docker.sock:/var/run/docker.sock
   security_opt:
     - label:disable
+  # Runner.Listener is the long-lived process; with EPHEMERAL unset it stays up
+  # between jobs, so its absence means the runner is dead or unregistered.
+  # Exec form on purpose: under CMD-SHELL the wrapping `sh -c` carries the
+  # pattern in its own cmdline and pgrep -f would match it, reporting healthy
+  # forever.
+  healthcheck:
+    test: ["CMD", "pgrep", "-f", "Runner.Listener"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 120s
+  # Give the SIGTERM trap time to deregister the runner before SIGKILL.
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
 
 services:
+  # Fixed RUNNER_NAME instead of the upstream random suffix: Coolify recreates
+  # containers on every redeploy, and config.sh runs with --replace, so these
+  # three names stay three entries in the org runner list instead of leaving a
+  # dead offline runner behind each time.
   runner:
     <<: *runner
+    environment:
+      <<: *runner-env
+      RUNNER_NAME: ${RUNNER_NAME_PREFIX:-runner}-1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - runner-work:/tmp/runner/work
@@ -35,6 +83,9 @@ services:
       - runner-cargo:/root/.cargo
   runner-2:
     <<: *runner
+    environment:
+      <<: *runner-env
+      RUNNER_NAME: ${RUNNER_NAME_PREFIX:-runner}-2
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - runner-work-2:/tmp/runner/work
@@ -45,6 +96,9 @@ services:
       - runner-cargo-2:/root/.cargo
   runner-3:
     <<: *runner
+    environment:
+      <<: *runner-env
+      RUNNER_NAME: ${RUNNER_NAME_PREFIX:-runner}-3
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - runner-work-3:/tmp/runner/work

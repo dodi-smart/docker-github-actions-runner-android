@@ -29,12 +29,65 @@ Existing named `runner-work*` volumes keep their data; new cache volumes
 start empty and warm on first jobs. Do not share one bun/gradle volume
 across the three containers: concurrent jobs would corrupt the same tree.
 
+## Deploying on Coolify
+
+The same file deploys as **one** Coolify resource running all three runners —
+create a Service (or an Application with the Docker Compose build pack) that
+points at `docker-compose.yml`, then fill in the Environment Variables tab.
+Coolify reads the variable syntax in the compose file:
+
+| Syntax | In the Coolify UI |
+|--------|-------------------|
+| `${VAR:?}` | Required — the deploy is blocked while it is empty (`APP_ID`, `APP_PRIVATE_KEY`, `APP_LOGIN`) |
+| `${VAR:-default}` | Editable, pre-filled (`RUNNER_NAME_PREFIX`, `LABELS`, `RUNNER_GROUP`) |
+| `VAR: "value"` | Hardcoded — not shown, not editable (`DISABLE_AUTO_UPDATE`) |
+
+Coolify's `SERVICE_FQDN_*` / `SERVICE_URL_*` / `SERVICE_PASSWORD_*` magic
+variables are deliberately unused: the runners publish no port, need no
+domain, and their only secret is the GitHub App key you supply. Nothing here
+needs generating. To run the stack on a second host against the same org,
+give that host a different `RUNNER_NAME_PREFIX` — the names are meant to stay
+readable in the GitHub runner list, so pick one rather than generating one.
+
+Coolify prefixes the named volumes with the resource UUID, so two stacks on
+one host never collide and the caches survive redeploys.
+
+### Stable runner names
+
+Each service pins `RUNNER_NAME` to `${RUNNER_NAME_PREFIX}-1` … `-3` instead of
+using the upstream random suffix. Coolify recreates containers on every
+redeploy, and `config.sh` runs with `--replace`, so the org runner list keeps
+exactly three entries instead of collecting an offline runner per redeploy.
+
+### `EPHEMERAL` and `DISABLE_AUTO_UPDATE` are traps
+
+The upstream entrypoint tests both with `[ -n ... ]`, so **any** non-empty
+value turns the flag on — `EPHEMERAL=false` passes `--ephemeral` and tears the
+runner down after every job, which also makes the health check flap. The
+compose file therefore never passes `EPHEMERAL` at all, and hardcodes
+`DISABLE_AUTO_UPDATE=true` (a self-updating runner writes into the container
+layer and loses the update on the next redeploy). Do not add either one in the
+Coolify UI.
+
+### Health check
+
+Each runner reports healthy while `Runner.Listener` is alive:
+
+```yaml
+test: ["CMD", "pgrep", "-f", "Runner.Listener"]
+```
+
+The exec form matters — under `CMD-SHELL` the wrapping `sh -c` carries the
+pattern in its own command line and `pgrep -f` matches itself, reporting
+healthy forever.
+
 ## X64 cache volumes
 
 This compose is for the **X64** class (`beelink`, `docker`, `large`). System
 labels (`Linux`, `X64`) are still applied by the runner binary; set
 `LABELS` in `.env` to `beelink,docker,large` (do not add a `build` label).
-`EPHEMERAL` stays `false` so the volumes survive between jobs.
+The runners are non-ephemeral (see above), so the volumes survive between
+jobs.
 
 Each runner gets its own:
 
