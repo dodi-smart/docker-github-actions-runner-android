@@ -10,7 +10,7 @@
 # Intentionally not using set -e: individual cleanup failures should not
 # prevent other cleanups from running.
 #
-# KEEP: /root/.bun, /root/.npm, /root/.cache/pnpm, /root/.cache/yarn,
+# KEEP: $HOME/.bun, $HOME/.npm, $HOME/.cache/pnpm, $HOME/.cache/yarn,
 #       Gradle modules-2 / build-cache-* / transforms-*, Cargo registry.
 # DELETE: /tmp contents except $RUNNER_WORKDIR (and $RUNNER_TEMP if under
 #         /tmp), Gradle daemon/journals/locks, runner _diag logs.
@@ -88,17 +88,18 @@ lru_cap() {
 clean_tmp
 
 # Gradle daemon / journals / locks only. Keep modules-2, build-cache-*,
-# transforms-*.
-rm -rf /root/.gradle/daemon/ 2>/dev/null || true
-rm -rf /root/.gradle/caches/journal-* 2>/dev/null || true
-find /root/.gradle -name '*.lock' -delete 2>/dev/null || true
+# transforms-*. $HOME covers both the root (default) and RUN_AS_ROOT=false
+# (/home/runner) runner users.
+rm -rf "$HOME"/.gradle/daemon/ 2>/dev/null || true
+rm -rf "$HOME"/.gradle/caches/journal-* 2>/dev/null || true
+find "$HOME"/.gradle -name '*.lock' -delete 2>/dev/null || true
 
 # Runner diagnostic logs
 find /actions-runner/_diag -name '*.log' -delete 2>/dev/null || true
 find /runner-data/_diag -name '*.log' -delete 2>/dev/null || true
 
-lru_cap /root/.gradle
-lru_cap /root/.bun
+lru_cap "$HOME"/.gradle
+lru_cap "$HOME"/.bun
 
 AFTER=$(df -h / | awk 'NR==2 {print $4}')
 echo "[cleanup] Post-job cleanup complete. Disk free: ${BEFORE} -> ${AFTER}"

@@ -20,12 +20,12 @@ echo "[pre-job] Surgical prune of incomplete cache entries..."
 # Bun: a killed job leaves partial tarballs (*.tmp / *.part). The next job
 # then fails with "Fail extracting tarball for ..." and it looks like a
 # dependency problem rather than a runner problem.
-find /root/.bun/install/cache \( -name '*.tmp' -o -name '*.part' \) -delete 2>/dev/null || true
+find "$HOME"/.bun/install/cache \( -name '*.tmp' -o -name '*.part' \) -delete 2>/dev/null || true
 
 # Gradle: leftover lock / journal / daemon state from a killed compile.
 # Keep modules-2, build-cache-*, and transforms-*.
-rm -f /root/.gradle/caches/modules-2/modules-2.lock 2>/dev/null || true
-rm -rf /root/.gradle/caches/journal-* 2>/dev/null || true
-rm -rf /root/.gradle/daemon/ 2>/dev/null || true
+rm -f "$HOME"/.gradle/caches/modules-2/modules-2.lock 2>/dev/null || true
+rm -rf "$HOME"/.gradle/caches/journal-* 2>/dev/null || true
+rm -rf "$HOME"/.gradle/daemon/ 2>/dev/null || true
 
 echo "[pre-job] Prune complete."
