@@ -90,6 +90,17 @@ ENV ANDROID_SDK_ROOT=$ANDROID_ROOT/sdk
 ENV ANDROID_HOME=$ANDROID_ROOT/sdk
 LABEL maintainer="asen.lekov@dodi.li"
 
+# Jobs run as root here, and GNU tar run as root keeps the owner ids stored in an
+# archive. Toolchains that setup actions unpack into /opt/hostedtoolcache (the
+# Flutter SDK, via subosito/flutter-action's `tar xf`) then belong to an unknown
+# uid, and because the Flutter SDK is a git checkout that the flutter tool runs
+# git on, git refuses it ("detected dubious ownership") and every flutter command
+# exits 128. --no-same-owner makes root extract as root, which is what a
+# non-root runner (GitHub-hosted) gets anyway. It stays global rather than a
+# safe.directory entry, because the image's git (2.43) has no prefix match and
+# the only other option, `safe.directory=*`, turns the check off for everything.
+ENV TAR_OPTIONS=--no-same-owner
+
 # Job hooks: JOB_STARTED is the poison sweep (covers OOM / killed runner);
 # JOB_COMPLETED is the tidy-up. Neither wipes package / Gradle caches.
 COPY pre-job.sh /usr/local/bin/pre-job.sh
