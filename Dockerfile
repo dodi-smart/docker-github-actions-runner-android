@@ -84,14 +84,6 @@ RUN attempt=1; \
 WORKDIR /actions-runner
 ENV PATH="${PATH}:/usr/local/lib/android/sdk/platform-tools/"
 
-# Image identity. deploy.yml passes the image tag and the commit it was built
-# from; jobs read them (e.g. the runner report) to tell which image they ran
-# on. They default to "dev" for local builds.
-ARG RUNNER_IMAGE_TAG=dev
-ARG RUNNER_IMAGE_REVISION=dev
-ENV RUNNER_IMAGE_TAG=$RUNNER_IMAGE_TAG
-ENV RUNNER_IMAGE_REVISION=$RUNNER_IMAGE_REVISION
-
 # Set env variable for SDK Root (https://developer.android.com/studio/command-line/variables)
 # ANDROID_HOME is deprecated, but older versions of Gradle rely on it
 ENV ANDROID_SDK_ROOT=$ANDROID_ROOT/sdk
@@ -142,6 +134,15 @@ ENV ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/cleanup.sh
 # registration happens instead. See preflight-entrypoint.sh for details.
 COPY preflight-entrypoint.sh /usr/local/bin/preflight-entrypoint.sh
 RUN chmod +x /usr/local/bin/preflight-entrypoint.sh
+# Image identity. deploy.yml passes the image tag and the commit it was built
+# from; jobs read them (e.g. the runner report) to tell which image they ran
+# on. They default to "dev" for local builds. Declared last: the values change
+# on every build, so anything after them would never hit the layer cache.
+ARG RUNNER_IMAGE_TAG=dev
+ARG RUNNER_IMAGE_REVISION=dev
+ENV RUNNER_IMAGE_TAG=$RUNNER_IMAGE_TAG \
+    RUNNER_IMAGE_REVISION=$RUNNER_IMAGE_REVISION
+
 ENTRYPOINT ["/usr/local/bin/preflight-entrypoint.sh"]
 # Declaring ENTRYPOINT resets the CMD inherited from the base image, so the
 # base image's CMD is restated here. See

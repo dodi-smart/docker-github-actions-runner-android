@@ -33,6 +33,21 @@ dir_bytes() {
   du -sb "$1" 2>/dev/null | awk '{print $1}'
 }
 
+# Print how many bytes dir $1 is over cap $2. Returns 1 (printing nothing) when
+# the dir is missing, unreadable, or already within the cap.
+excess_bytes() {
+  local dir="$1" cap="$2" size
+  [ -d "$dir" ] || return 1
+  size=$(dir_bytes "$dir")
+  [ -n "$size" ] || return 1
+  if [ "$size" -le "$cap" ]; then
+    log "$dir ${size}B <= cap ${cap}B" >&2
+    return 1
+  fi
+  log "$dir is ${size}B (cap ${cap}B)" >&2
+  echo $((size - cap))
+}
+
 # LRU-evict regular files, least recently accessed first, until $1 is at or
 # under $2 bytes. Ordered by atime (a read counts as use; Gradle never touches
 # mtime on read, so mtime order evicted the most-used dependencies first).
@@ -40,16 +55,9 @@ dir_bytes() {
 # change. Does not wholesale wipe the tree.
 lru_cap() {
   local dir="$1" cap="${2:-$CACHE_CAP_BYTES}"
-  [ -d "$dir" ] || return 0
-  local size
-  size=$(dir_bytes "$dir")
-  [ -n "$size" ] || return 0
-  if [ "$size" -le "$cap" ]; then
-    log "$dir ${size}B <= cap ${cap}B"
-    return 0
-  fi
-  local excess=$((size - cap)) freed=0 rec fsize path
-  log "$dir is ${size}B (cap ${cap}B); LRU-evicting least recently used files"
+  local excess freed=0 rec fsize path
+  excess=$(excess_bytes "$dir" "$cap") || return 0
+  log "evicting least recently used files from $dir"
   while IFS= read -r -d '' rec; do
     [ "$freed" -ge "$excess" ] && break
     rec="${rec#*	}"        # drop atime
@@ -70,16 +78,9 @@ lru_cap() {
 lru_cap_mise_installs() {
   local data="$1" cap="${2:-$MISE_DATA_CAP_BYTES}"
   local installs="$data/installs"
-  [ -d "$installs" ] || return 0
-  local size
-  size=$(dir_bytes "$installs")
-  [ -n "$size" ] || return 0
-  if [ "$size" -le "$cap" ]; then
-    log "$installs ${size}B <= cap ${cap}B"
-    return 0
-  fi
-  local excess=$((size - cap)) freed=0 rec path dsize
-  log "$installs is ${size}B (cap ${cap}B); evicting oldest tool versions"
+  local excess freed=0 rec path dsize
+  excess=$(excess_bytes "$installs" "$cap") || return 0
+  log "evicting oldest tool versions from $installs"
   while IFS= read -r -d '' rec; do
     [ "$freed" -ge "$excess" ] && break
     path="${rec#*	}"

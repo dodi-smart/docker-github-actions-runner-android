@@ -64,12 +64,8 @@ clean_tmp() {
   workdir="${workdir%/}"
   temp="${temp%/}"
 
-  if [ -n "$temp" ] && [ "$temp" != "/tmp" ] && [ "${temp#/tmp/}" = "$temp" ]; then
-    temp=""
-  fi
-  if [ "$temp" = "/tmp" ]; then
-    temp=""
-  fi
+  # Only a RUNNER_TEMP strictly under /tmp needs sparing.
+  case "$temp" in /tmp/*) ;; *) temp="" ;; esac
 
   clean_dir /tmp "$workdir" "$temp"
 }
@@ -88,9 +84,6 @@ find "$HOME"/.gradle/caches -maxdepth 3 -name '*.lock' -delete 2>/dev/null || tr
 # Runner diagnostic logs
 find /actions-runner/_diag -name '*.log' -delete 2>/dev/null || true
 find /runner-data/_diag -name '*.log' -delete 2>/dev/null || true
-
-# Cache size caps (gradle, bun, mise, hk, ...) are enforced by pruner.sh, not
-# here - see issue #16.
 
 AFTER=$(df -h / | awk 'NR==2 {print $4}')
 echo "[cleanup] Post-job cleanup complete. Disk free: ${BEFORE} -> ${AFTER}"
