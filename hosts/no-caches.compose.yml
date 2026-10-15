@@ -1,0 +1,24 @@
+# For small hosts (e.g. ARM64 boards with little disk): no per-runner cache
+# volumes, only docker.sock, the work volume and the action archive cache.
+#   COMPOSE_FILE=docker-compose.yml:hosts/no-caches.compose.yml   (in .env)
+# `!override` replaces the base volume lists instead of merging into them.
+services:
+  runner:
+    volumes: !override
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner-work:/tmp/runner/work
+      - runner-action-cache:/opt/actionarchivecache:ro
+  runner-2:
+    volumes: !override
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner-work-2:/tmp/runner/work
+      - runner-action-cache:/opt/actionarchivecache:ro
+  runner-3:
+    volumes: !override
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner-work-3:/tmp/runner/work
+      - runner-action-cache:/opt/actionarchivecache:ro
+  pruner:
+    volumes: !override
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner-action-cache:/opt/actionarchivecache

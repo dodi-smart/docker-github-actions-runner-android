@@ -8,6 +8,14 @@
 #   1. LRU size caps on the per-runner cache volumes (mounted under
 #      $CACHES_ROOT/<runner>/<name>, see docker-compose.yml).
 #   2. docker system prune / builder prune on the host daemon (docker.sock).
+#   3. Hourly, in the background: fill the shared action archive cache.
+#
+# Action archive cache: the runner copies
+# $ACTION_CACHE_DIR/<owner>_<repo>/<sha>.tar.gz instead of downloading when it
+# exists, but never writes it. prefetch_actions() fills it as the GitHub App, so
+# downloads count against the App rather than the host IP (codeload 429s).
+# Refs: every `uses:` found in the PREFETCH_SOURCES repos, plus PREFETCH_EXTRA.
+# `pruner.sh prefetch` runs it once (rollout warm-up).
 #
 # Env:
 #   PRUNE_INTERVAL_SECONDS   sleep between runs            (default 86400)
@@ -17,6 +25,9 @@
 #   CACHES_ROOT              where the cache volumes are mounted (/caches)
 #   CACHE_CAP_BYTES          cap for each file-level cache dir   (20 GiB)
 #   MISE_DATA_CAP_BYTES      cap for each mise installs tree     (20 GiB)
+#   ACTION_CACHE_CAP_BYTES   cap for the action archive cache (2 GiB)
+#   PREFETCH_SOURCES / PREFETCH_EXTRA   "owner/repo@ref ..." to scan / fetch as-is
+#   PREFETCH_INTERVAL_SECONDS  prefetch period (default 3600; 0 = off)
 #   DOCKER_PRUNE_UNTIL / DOCKER_BUILDER_PRUNE_UNTIL   (24h / 72h)
 #
 # Intentionally not using set -e: one failing step must not stop the others.
@@ -24,6 +35,11 @@
 CACHES_ROOT="${CACHES_ROOT:-/caches}"
 CACHE_CAP_BYTES="${CACHE_CAP_BYTES:-21474836480}" # 20 GiB
 MISE_DATA_CAP_BYTES="${MISE_DATA_CAP_BYTES:-21474836480}" # 20 GiB
+ACTION_CACHE_DIR=/opt/actionarchivecache # mount point in docker-compose.yml
+ACTION_CACHE_CAP_BYTES="${ACTION_CACHE_CAP_BYTES:-2147483648}" # 2 GiB
+PREFETCH_SOURCES="${PREFETCH_SOURCES:-}"
+PREFETCH_EXTRA="${PREFETCH_EXTRA:-}"
+GITHUB_API="https://api.github.com"
 DOCKER_PRUNE_UNTIL="${DOCKER_PRUNE_UNTIL:-24h}"
 DOCKER_BUILDER_PRUNE_UNTIL="${DOCKER_BUILDER_PRUNE_UNTIL:-72h}"
 
@@ -104,6 +120,89 @@ prune_caches() {
     lru_cap "$runner/hk"
     lru_cap_mise_installs "$runner/mise-data"
   done
+  lru_cap "$ACTION_CACHE_DIR" "$ACTION_CACHE_CAP_BYTES"
+}
+
+gh_curl() {
+  curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
+    -H "Authorization: Bearer ${GH_TOKEN}" -H "X-GitHub-Api-Version: 2022-11-28" "$@"
+}
+
+# Print "owner/repo ref" for every remote action under tree $1. Skips local
+# (./), docker:// and reusable-workflow (.github/workflows/) refs, which the
+# runner never fetches as an action archive; subpath actions (owner/repo/sub)
+# share the owner/repo archive.
+action_refs_from_tree() {
+  grep -rhE --include='*.yml' --include='*.yaml' '^[[:space:]-]*uses:[[:space:]]' "$1" 2>/dev/null |
+    sed -E 's/^[[:space:]-]*uses:[[:space:]]*//; s/["'"'"']//g; s/[[:space:]#].*$//' |
+    awk -F@ 'NF == 2 && $1 !~ /^(\.|docker:)/ && $1 !~ /[$]/ && $1 !~ /\.github\/workflows\// {
+      split($1, p, "/"); if (p[2] != "") print p[1] "/" p[2], $2 }'
+}
+
+# Fetch the archive of $1 (owner/repo) at $2 (tag, branch or sha) into the
+# cache as <owner>_<repo>/<sha>.tar.gz, via temp file + rename so a runner never
+# reads a partial file. Prints 1 when it downloaded something.
+prefetch_one() {
+  local name="$1" ref="$2" sha="$2" dir file tmp
+  dir="$ACTION_CACHE_DIR/${name//\//_}"
+  if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    sha=$(gh_curl -H 'Accept: application/vnd.github.sha' "$GITHUB_API/repos/$name/commits/$ref") &&
+      [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { log "prefetch: cannot resolve $name@$ref" >&2; return 1; }
+  fi
+  file="$dir/$sha.tar.gz"
+  [ -s "$file" ] && return 0
+  mkdir -p "$dir" && tmp=$(mktemp "$dir/.tmp.XXXXXX") || return 1
+  if gh_curl -o "$tmp" "$GITHUB_API/repos/$name/tarball/$sha" && tar -tzf "$tmp" >/dev/null 2>&1; then
+    chmod 644 "$tmp" && mv -f "$tmp" "$file" && { log "prefetch: cached $name@$sha ($ref)" >&2; echo 1; return 0; }
+  fi
+  rm -f "$tmp"
+  log "prefetch: download failed for $name@$sha" >&2
+  return 1
+}
+
+prefetch_actions() {
+  local work src refs name ref out n=0 fetched=0 failed=0 token
+  [ -n "$PREFETCH_SOURCES$PREFETCH_EXTRA" ] || return 0 # cache not configured
+  if [ -z "${APP_ID:-}" ] || [ -z "${APP_PRIVATE_KEY:-}" ] || [ -z "${APP_LOGIN:-}" ]; then
+    log "prefetch: APP_ID/APP_PRIVATE_KEY/APP_LOGIN not set; skipping"
+    return 0
+  fi
+  mkdir -p "$ACTION_CACHE_DIR" || return 0
+  # Same \n unescaping as the upstream entrypoint applies to APP_PRIVATE_KEY.
+  token=$(APP_PRIVATE_KEY="${APP_PRIVATE_KEY//\\n/$'\n'}" bash /app_token.sh 2>/dev/null)
+  if [ -z "$token" ] || [ "$token" = null ]; then
+    log "prefetch: could not mint an installation token; skipping"
+    return 0
+  fi
+  GH_TOKEN="$token"
+  work=$(mktemp -d) || return 0
+  : > "$work/refs"
+  for src in $PREFETCH_SOURCES; do
+    mkdir -p "$work/src"
+    if gh_curl -o "$work/src.tgz" "$GITHUB_API/repos/${src%@*}/tarball/${src#*@}" &&
+       tar -xzf "$work/src.tgz" -C "$work/src"; then
+      action_refs_from_tree "$work/src" >> "$work/refs"
+    else
+      log "prefetch: cannot read source $src"
+    fi
+    rm -rf "$work/src" "$work/src.tgz"
+  done
+  for src in $PREFETCH_EXTRA; do echo "${src%@*} ${src#*@}" >> "$work/refs"; done
+  refs=$(sort -u "$work/refs")
+  rm -rf "$work"
+  while read -r name ref; do
+    [ -n "$name" ] && [ -n "$ref" ] || continue
+    n=$((n + 1))
+    if out=$(prefetch_one "$name" "$ref"); then
+      [ "$out" = 1 ] && fetched=$((fetched + 1))
+    else
+      failed=$((failed + 1))
+    fi
+  done <<< "$refs"
+  # Stale temp files from an interrupted download.
+  find "$ACTION_CACHE_DIR" -name '.tmp.*' -mmin +60 -delete 2>/dev/null
+  log "prefetch: $n refs, $fetched downloaded, $failed failed"
+  GH_TOKEN=""
 }
 
 prune_docker() {
@@ -126,9 +225,24 @@ run_once() {
   log "done. Disk free: ${before} -> ${after}"
 }
 
+if [ "${1:-}" = prefetch ]; then
+  prefetch_actions
+  exit 0
+fi
+
 if [ "${PRUNE_RUN_ONCE:-}" = "true" ]; then
   run_once
   exit 0
+fi
+
+if [ "${PREFETCH_INTERVAL_SECONDS:-3600}" -gt 0 ]; then
+  (
+    sleep 30
+    while true; do
+      prefetch_actions
+      sleep "${PREFETCH_INTERVAL_SECONDS:-3600}"
+    done
+  ) &
 fi
 
 sleep "${PRUNE_INITIAL_DELAY:-300}"
