@@ -45,6 +45,17 @@ general jobs and `heavy` for memory-hungry ones. Workflows then ask for
 its name. A host can carry several labels, so a large machine labelled
 `build,heavy` also picks up general jobs when the others are busy.
 
+**One runner in another pool.** `RUNNER_<N>_LABELS` (for `runner`, `runner-2`,
+`runner-3`) replaces `LABELS` for that runner alone. A host whose runners are
+`light` can let one of them also build, with
+`RUNNER_3_LABELS=docker,x86,light,large`, without a second host file.
+
+**Coordination runners.** `COMPOSE_PROFILES=control` adds two runners that
+carry only `CONTROL_LABELS` (default `control`). Point the short jobs a merge
+waits on at them, such as a picker or a required summary job, so those never
+queue behind long builds. They hold no `docker.sock` and no tool cache, so keep
+jobs that check out and build code off them.
+
 **Small hosts.** Boards such as a Raspberry Pi have little disk. Layer
 [`hosts/no-caches.compose.yml`](hosts/no-caches.compose.yml) by setting
 `COMPOSE_FILE` in `.env`. Those runners skip the per-runner cache volumes.

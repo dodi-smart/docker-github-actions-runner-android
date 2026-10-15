@@ -4,10 +4,10 @@
 # read-only in every runner, filled by the pruner. `volumes:` lists replace on
 # merge, so docker.sock is repeated per service. Small hosts can layer
 # hosts/no-caches.compose.yml on top (see README).
-x-runner: &runner
-  image: ${RUNNER_IMAGE:-ghcr.io/dodi-smart/github-runner}
-  restart: unless-stopped
-  environment:
+# The environment is its own anchor so a service can change one key (LABELS)
+# without restating the rest: a `<<:` merge replaces a whole mapping, so
+# `environment:` in a service would otherwise drop every other variable.
+x-runner-env: &runner-env
     APP_ID: ${APP_ID}
     APP_PRIVATE_KEY: ${APP_PRIVATE_KEY}
     APP_LOGIN: ${APP_LOGIN}
@@ -36,6 +36,11 @@ x-runner: &runner
     # downloads, and only reads: the `pruner` service fills the shared
     # runner-action-cache volume (see pruner.sh), mounted read-only below.
     ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE: /opt/actionarchivecache
+
+x-runner: &runner
+  image: ${RUNNER_IMAGE:-ghcr.io/dodi-smart/github-runner}
+  restart: unless-stopped
+  environment: *runner-env
   # Runner.Listener is the long-lived process of a registered runner. Exec form
   # on purpose: under CMD-SHELL the wrapping `sh -c` carries the pattern in its
   # own command line and `pgrep -f` would match itself, healthy forever. The
@@ -52,9 +57,29 @@ x-runner: &runner
   security_opt:
     - label:disable
 
+# Coordination runners carry only CONTROL_LABELS (default `control`), never a
+# work label, so no build or test can land on them: they exist so the short
+# jobs a merge waits on (a picker, a required summary) never queue behind long
+# work. Those jobs read the API and check nothing out, so each service mounts
+# no docker.sock and no tool cache, only its work directory and the read-only
+# action cache.
+x-control: &control
+  <<: *runner
+  profiles: [control]
+  environment:
+    <<: *runner-env
+    LABELS: ${CONTROL_LABELS:-control}
+    RUNNER_NAME_PREFIX: ${RUNNER_NAME_PREFIX:-runner}-control
+
 services:
+  # Each runner registers with the host's LABELS, or with RUNNER_<N>_LABELS when
+  # that is set: one runner of a host can then join another pool (a `large`
+  # runner on a host whose others stay `light`) without a second host file.
   runner:
     <<: *runner
+    environment:
+      <<: *runner-env
+      LABELS: ${RUNNER_1_LABELS:-${LABELS:-docker}}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - runner-work:/tmp/runner/work
@@ -71,6 +96,9 @@ services:
       - runner-action-cache:/opt/actionarchivecache:ro
   runner-2:
     <<: *runner
+    environment:
+      <<: *runner-env
+      LABELS: ${RUNNER_2_LABELS:-${LABELS:-docker}}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - runner-work-2:/tmp/runner/work
@@ -87,6 +115,9 @@ services:
       - runner-action-cache:/opt/actionarchivecache:ro
   runner-3:
     <<: *runner
+    environment:
+      <<: *runner-env
+      LABELS: ${RUNNER_3_LABELS:-${LABELS:-docker}}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - runner-work-3:/tmp/runner/work
@@ -100,6 +131,17 @@ services:
       - runner-mise-data-3:/root/.local/share/mise
       - runner-mise-cache-3:/root/.cache/mise
       - runner-hk-3:/root/.cache/hk
+      - runner-action-cache:/opt/actionarchivecache:ro
+  # Coordination runners (see x-control), off unless COMPOSE_PROFILES=control.
+  control:
+    <<: *control
+    volumes:
+      - runner-work-control:/tmp/runner/work
+      - runner-action-cache:/opt/actionarchivecache:ro
+  control-2:
+    <<: *control
+    volumes:
+      - runner-work-control-2:/tmp/runner/work
       - runner-action-cache:/opt/actionarchivecache:ro
   # Maintenance off the job path (pruner.sh): nightly cache caps and docker
   # prune, hourly action-cache fill. Mounts only what it caps.
@@ -144,6 +186,8 @@ volumes:
   runner-work: {}
   runner-work-2: {}
   runner-work-3: {}
+  runner-work-control: {}
+  runner-work-control-2: {}
   runner-bun: {}
   runner-bun-2: {}
   runner-bun-3: {}
