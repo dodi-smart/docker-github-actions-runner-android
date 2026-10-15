@@ -2,41 +2,62 @@
 # Post-job cleanup script for GitHub Actions runner.
 # Invoked automatically via ACTIONS_RUNNER_HOOK_JOB_COMPLETED after each job.
 #
-# Persist package and Gradle/Cargo caches on the named volumes. Cap each
-# runner's gradle-home and bun-home at ~20 GB with LRU eviction — do not
-# wholesale wipe. JOB_STARTED (pre-job.sh) is the poison sweep for a killed
-# runner process; this hook is the tidy-up when the job finishes normally.
+# Persist package, Gradle/Cargo and mise/hk caches on the named volumes. This
+# hook only does the CHEAP tidy-up that has to happen after every job. The
+# expensive size-cap scans (du over multi-GB trees, LRU eviction) used to run
+# here and cost 21-39 s per job (issue #16); they now live in pruner.sh, run
+# nightly by the `pruner` compose service. JOB_STARTED (pre-job.sh) is the
+# poison sweep for a killed runner process.
 #
 # Intentionally not using set -e: individual cleanup failures should not
 # prevent other cleanups from running.
 #
 # KEEP: $HOME/.bun, $HOME/.npm, $HOME/.cache/pnpm, $HOME/.cache/yarn,
+#       $HOME/.cache/mise, $HOME/.local/share/mise, $HOME/.cache/hk,
+#       $HOME/.konan, $HOME/.rustup,
 #       Gradle modules-2 / build-cache-* / transforms-*, Cargo registry.
 # DELETE: /tmp contents except $RUNNER_WORKDIR (and $RUNNER_TEMP if under
 #         /tmp), Gradle daemon/journals/locks, runner _diag logs.
 
-CACHE_CAP_BYTES="${CACHE_CAP_BYTES:-21474836480}" # 20 GiB
-
 echo "[cleanup] Running post-job cleanup..."
 BEFORE=$(df -h / | awk 'NR==2 {print $4}')
 
-# True when $1 is $2, a descendant of $2, or an ancestor of $2.
-_spared() {
-  local path="$1"
-  local keep="$2"
-  [ -z "$keep" ] && return 1
-  case "$path" in
-    "$keep"|"$keep"/*) return 0 ;;
-  esac
-  case "$keep" in
-    "$path"/*) return 0 ;;
-  esac
+# True when $1 is $2 or lives inside $2.
+_inside() {
+  [ -n "$2" ] || return 1
+  case "$1" in "$2"|"$2"/*) return 0 ;; esac
+  return 1
+}
+
+# True when $1 is a strict ancestor of $2.
+_ancestor_of() {
+  [ -n "$2" ] || return 1
+  case "$2" in "$1"/*) return 0 ;; esac
   return 1
 }
 
 # RUNNER_WORKDIR is /tmp/runner/work on the beelinks. A blanket
 # `find /tmp -delete` wipes the work volume. Spare the workdir (and
 # RUNNER_TEMP if it sits under /tmp), plus their ancestors under /tmp.
+#
+# Walk top-down and never descend into a spared tree: the work volume holds
+# checkouts plus node_modules, and `find -depth` (which disables -prune) used
+# to walk every path in it on every job. Only strict ancestors of a spared
+# path are entered, so the cost is the handful of entries outside the workdir.
+clean_dir() {
+  local dir="$1" workdir="$2" temp="$3" path
+  while IFS= read -r -d '' path; do
+    if _inside "$path" "$workdir" || _inside "$path" "$temp"; then
+      continue
+    fi
+    if _ancestor_of "$path" "$workdir" || _ancestor_of "$path" "$temp"; then
+      clean_dir "$path" "$workdir" "$temp"
+      continue
+    fi
+    rm -rf "$path" 2>/dev/null || true
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+}
+
 clean_tmp() {
   local workdir="${RUNNER_WORKDIR:-/tmp/runner/work}"
   local temp="${RUNNER_TEMP:-}"
@@ -50,39 +71,7 @@ clean_tmp() {
     temp=""
   fi
 
-  local path
-  while IFS= read -r -d '' path; do
-    _spared "$path" "$workdir" && continue
-    _spared "$path" "$temp" && continue
-    rm -rf "$path" 2>/dev/null || true
-  done < <(find /tmp -mindepth 1 -depth -print0 2>/dev/null)
-}
-
-# LRU-evict oldest regular files until $1 is at or under CACHE_CAP_BYTES.
-# Does not wholesale wipe the tree.
-lru_cap() {
-  local dir="$1"
-  [ -d "$dir" ] || return 0
-  local size
-  size=$(du -sb "$dir" 2>/dev/null | awk '{print $1}')
-  [ -n "$size" ] || return 0
-  if [ "$size" -le "$CACHE_CAP_BYTES" ]; then
-    return 0
-  fi
-  local excess=$((size - CACHE_CAP_BYTES))
-  local freed=0
-  echo "[cleanup] $dir is ${size} bytes (cap ${CACHE_CAP_BYTES}); LRU-evicting oldest files"
-  local rec fsize path
-  while IFS= read -r -d '' rec; do
-    [ "$freed" -ge "$excess" ] && break
-    rec="${rec#*	}"
-    fsize="${rec%%	*}"
-    path="${rec#*	}"
-    [ -n "$path" ] && [ -n "$fsize" ] || continue
-    rm -f "$path" 2>/dev/null || true
-    freed=$((freed + fsize))
-  done < <(find "$dir" -type f -printf '%T@\t%s\t%p\0' 2>/dev/null | sort -z -n)
-  find "$dir" -type d -empty -delete 2>/dev/null || true
+  clean_dir /tmp "$workdir" "$temp"
 }
 
 clean_tmp
@@ -92,14 +81,16 @@ clean_tmp
 # (/home/runner) runner users.
 rm -rf "$HOME"/.gradle/daemon/ 2>/dev/null || true
 rm -rf "$HOME"/.gradle/caches/journal-* 2>/dev/null || true
-find "$HOME"/.gradle -name '*.lock' -delete 2>/dev/null || true
+# Shallow on purpose: Gradle's lock files sit at most three levels under
+# caches/, and a find over the whole (multi-GB) tree is what made this slow.
+find "$HOME"/.gradle/caches -maxdepth 3 -name '*.lock' -delete 2>/dev/null || true
 
 # Runner diagnostic logs
 find /actions-runner/_diag -name '*.log' -delete 2>/dev/null || true
 find /runner-data/_diag -name '*.log' -delete 2>/dev/null || true
 
-lru_cap "$HOME"/.gradle
-lru_cap "$HOME"/.bun
+# Cache size caps (gradle, bun, mise, hk, ...) are enforced by pruner.sh, not
+# here - see issue #16.
 
 AFTER=$(df -h / | awk 'NR==2 {print $4}')
 echo "[cleanup] Post-job cleanup complete. Disk free: ${BEFORE} -> ${AFTER}"
