@@ -73,6 +73,17 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      # Image identity baked into the image as RUNNER_IMAGE_TAG /
+      # RUNNER_IMAGE_REVISION (Dockerfile ARG -> ENV). The tag is the fully
+      # pinned one, which never changes meaning; the revision is the commit.
+      - name: Docker metadata (image identity)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/github-runner
+          tags: |
+            type=raw,value=${{ steps.versions.outputs.runner_version }}-jdk${{ matrix.java_version }}-sdk${{ steps.versions.outputs.compile_sdk }}-node${{ matrix.node_version }}
+
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v7
@@ -89,6 +100,8 @@ jobs:
             VERSION=${{ steps.versions.outputs.runner_tag }}
             JAVA_VERSION=${{ matrix.java_version }}
             NODE_VERSION=${{ matrix.node_version }}
+            RUNNER_IMAGE_TAG=${{ steps.meta.outputs.version }}
+            RUNNER_IMAGE_REVISION=${{ github.sha }}
           outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/github-runner,push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
