@@ -36,7 +36,7 @@ _ancestor_of() {
   return 1
 }
 
-# RUNNER_WORKDIR is /tmp/runner/work on the beelinks. A blanket
+# RUNNER_WORKDIR is /tmp/runner/work in docker-compose.yml. A blanket
 # `find /tmp -delete` wipes the work volume. Spare the workdir (and
 # RUNNER_TEMP if it sits under /tmp), plus their ancestors under /tmp.
 #

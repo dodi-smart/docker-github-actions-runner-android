@@ -1,12 +1,11 @@
-# X64 runner layout (beelink by default; hetzner uses the same file with its own
-# .env, see hosts/): three runners, each with its own work and cache volumes,
-# plus a nightly `pruner`. Do not share bun/gradle/npm/cargo/mise volumes
-# across runner services - concurrent jobs would corrupt the same tree. YAML
-# merge of volumes: replaces the list, so docker.sock is repeated on each
-# service. ARM64 / rpi5 hosts layer hosts/rpi5.compose.yml on top (no heavy
-# cache volumes), see README.
+# Three ephemeral runners, each with its own work and cache volumes, plus a
+# `pruner` for maintenance. Never share a cache volume between runners:
+# concurrent jobs would corrupt it. The action archive cache is the exception:
+# read-only in every runner, filled by the pruner. `volumes:` lists replace on
+# merge, so docker.sock is repeated per service. Small hosts can layer
+# hosts/no-caches.compose.yml on top (see README).
 x-runner: &runner
-  image: ghcr.io/dodi-smart/github-runner
+  image: ${RUNNER_IMAGE:-ghcr.io/dodi-smart/github-runner}
   restart: unless-stopped
   environment:
     APP_ID: ${APP_ID}
@@ -16,7 +15,7 @@ x-runner: &runner
     RUNNER_WORKDIR: /tmp/runner/work
     RUNNER_SCOPE: org
     ORG_NAME: ${APP_LOGIN}
-    LABELS: ${LABELS:-self-hosted,Linux,X64,docker,x86,large,light,beelink}
+    LABELS: ${LABELS:-docker}
     RUNNER_GROUP: ${RUNNER_GROUP:-Default}
     # The upstream entrypoint only tests these with `[ -n "$VAR" ]`, so ANY
     # non-empty value - including "false" - turns the flag on.
@@ -31,6 +30,12 @@ x-runner: &runner
     # non-empty value to disable updates; `DISABLE_AUTO_UPDATE=false` disables
     # them too. See .env.example.
     DISABLE_AUTO_UPDATE: ${DISABLE_AUTO_UPDATE:-}
+    # Ephemeral runners re-download every action archive for every job, and the
+    # few public IPs of these hosts hit codeload.github.com's 429 limit. The
+    # runner (>= 2.319) reads <dir>/<owner>_<repo>/<sha>.tar.gz before it
+    # downloads, and only reads: the `pruner` service fills the shared
+    # runner-action-cache volume (see pruner.sh), mounted read-only below.
+    ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE: /opt/actionarchivecache
   # Runner.Listener is the long-lived process of a registered runner. Exec form
   # on purpose: under CMD-SHELL the wrapping `sh -c` carries the pattern in its
   # own command line and `pgrep -f` would match itself, healthy forever. The
@@ -63,6 +68,7 @@ services:
       - runner-mise-data:/root/.local/share/mise
       - runner-mise-cache:/root/.cache/mise
       - runner-hk:/root/.cache/hk
+      - runner-action-cache:/opt/actionarchivecache:ro
   runner-2:
     <<: *runner
     volumes:
@@ -78,6 +84,7 @@ services:
       - runner-mise-data-2:/root/.local/share/mise
       - runner-mise-cache-2:/root/.cache/mise
       - runner-hk-2:/root/.cache/hk
+      - runner-action-cache:/opt/actionarchivecache:ro
   runner-3:
     <<: *runner
     volumes:
@@ -93,19 +100,22 @@ services:
       - runner-mise-data-3:/root/.local/share/mise
       - runner-mise-cache-3:/root/.cache/mise
       - runner-hk-3:/root/.cache/hk
-  # Nightly maintenance, off the job path (issue #16: the same scans inside the
-  # per-job cleanup.sh cost 21-39 s on every job). Same image, pruner.sh as the
-  # entrypoint. It needs only the caches it caps (not work/npm/pnpm/...), and
-  # docker.sock to prune the host daemon: `docker system prune -af --filter
-  # until=24h` and `docker builder prune -af --filter until=72h`. Named volumes
-  # are never pruned. Tunables: PRUNE_INTERVAL_SECONDS, CACHE_CAP_BYTES, ...
-  # (see pruner.sh).
+      - runner-action-cache:/opt/actionarchivecache:ro
+  # Maintenance off the job path (pruner.sh): nightly cache caps and docker
+  # prune, hourly action-cache fill. Mounts only what it caps.
   pruner:
-    image: ghcr.io/dodi-smart/github-runner
+    image: ${RUNNER_IMAGE:-ghcr.io/dodi-smart/github-runner}
     restart: unless-stopped
     entrypoint: ["/usr/local/bin/pruner.sh"]
     environment:
       CACHES_ROOT: /caches
+      APP_ID: ${APP_ID} # App token for authenticated action downloads
+      APP_PRIVATE_KEY: ${APP_PRIVATE_KEY}
+      APP_LOGIN: ${APP_LOGIN}
+      ACTION_CACHE_CAP_BYTES: ${ACTION_CACHE_CAP_BYTES:-2147483648}
+      PREFETCH_SOURCES: ${PREFETCH_SOURCES:-}
+      PREFETCH_EXTRA: ${PREFETCH_EXTRA:-}
+      PREFETCH_INTERVAL_SECONDS: ${PREFETCH_INTERVAL_SECONDS:-3600}
       CACHE_CAP_BYTES: ${CACHE_CAP_BYTES:-21474836480}
       PRUNE_INTERVAL_SECONDS: ${PRUNE_INTERVAL_SECONDS:-86400}
     volumes:
@@ -125,10 +135,12 @@ services:
       - runner-mise-cache-3:/caches/3/mise-cache
       - runner-hk-3:/caches/3/hk
       - runner-mise-data-3:/caches/3/mise-data
+      - runner-action-cache:/opt/actionarchivecache
     security_opt:
       - label:disable
 
 volumes:
+  runner-action-cache: {} # read-only in runners, filled by the pruner
   runner-work: {}
   runner-work-2: {}
   runner-work-3: {}
