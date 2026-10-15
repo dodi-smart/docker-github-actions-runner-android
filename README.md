@@ -17,39 +17,142 @@ Linux hosts run natively without emulation.
 To run the container, check out the environment variables from the base image:
 https://github.com/myoung34/docker-github-actions-runner#environment-variables
 
-[`docker-compose.yml`](docker-compose.yml) is the X64 beelink layout — three
-persistent runners, each with its own work **and** cache volumes — not a
-side file. After pulling a new image on the host:
+[`docker-compose.yml`](docker-compose.yml) is the X64 layout (beelink by
+default; hetzner uses the same file with its own `.env`) — three ephemeral
+runners, each with its own work **and** cache volumes, plus a nightly
+`pruner`. Per-host `.env` examples with the target labels are in
+[`hosts/`](hosts/). After pulling a new image on a host:
 
 ```
 docker compose pull && docker compose up -d
 ```
 
 Existing named `runner-work*` volumes keep their data; new cache volumes
-start empty and warm on first jobs. Do not share one bun/gradle volume
+start empty and warm on first jobs. Do not share one bun/gradle/mise volume
 across the three containers: concurrent jobs would corrupt the same tree.
+
+## Runner pools and labels
+
+Jobs pick runners by capability label, never by machine name. Each host's
+`.env` sets `LABELS` (the runner binary adds `self-hosted`, the OS and the
+architecture itself):
+
+| Pool | `.env` example | `LABELS` | Caches |
+|------|----------------|----------|--------|
+| hetzner (X64) | [`hosts/hetzner.env.example`](hosts/hetzner.env.example) | `self-hosted,Linux,X64,docker,x86,light,agent,hetzner` | all volumes |
+| beelink (X64) | [`hosts/beelink.env.example`](hosts/beelink.env.example) | `self-hosted,Linux,X64,docker,x86,large,light,beelink` | all volumes |
+| rpi5 (ARM64) | [`hosts/rpi5.env.example`](hosts/rpi5.env.example) | `self-hosted,Linux,ARM64,docker,agent,rpi5` | work only |
+
+| Capability label | Meaning |
+|------------------|---------|
+| `light` | default checks, release, deploy steps (X64 only: no rpi5) |
+| `large` | heavy jobs: Gradle/Android, Next.js builds (beelink) |
+| `agent` | review, triage, assist (hetzner and rpi5) |
+
+The rpi5 pool is an agent/utility pool: it has no `light` label and must not
+mount the heavy cache volumes. Its `.env` example sets
+`COMPOSE_FILE=docker-compose.yml:hosts/rpi5.compose.yml`, which layers
+[`hosts/rpi5.compose.yml`](hosts/rpi5.compose.yml) over the base file so each
+runner keeps only `docker.sock` and its work volume (and the pruner only
+prunes Docker).
+
+### Rolling out a label change
+
+Runners are ephemeral and re-register on their next job, so changing labels is
+a `.env` edit plus a recreate:
+
+1. Copy the host's `hosts/<host>.env.example` values into its `.env` (keep the
+   real `APP_*` values). On rpi5 also keep the `COMPOSE_FILE` line.
+2. `docker compose pull && docker compose up -d`.
+3. Check the pool in the org's runner list (Settings, Actions, Runners): each
+   runner should show the labels above. `docker compose ps` shows `healthy`
+   once `Runner.Listener` is up.
+
+## Ephemeral runners
+
+`EPHEMERAL` is `"true"` in the compose file. The upstream entrypoint
+(`myoung34/github-runner`) only tests `[ -n "${EPHEMERAL}" ]` (and the same for
+`DISABLE_AUTO_UPDATE`), so any non-empty value, `"false"` included, passes
+`--ephemeral` to `config.sh`. The previous `EPHEMERAL: "false"` therefore
+never kept runners persistent: they have always been ephemeral, one job per
+container, restarted by `restart: unless-stopped`. The compose file now says
+what actually happens. Each job gets a clean container; the caches survive on
+the named volumes below.
+
+`DISABLE_AUTO_UPDATE` is empty by default. Set it to any non-empty value in
+`.env` to disable runner self-update (`false` disables it too).
+
+## Health check
+
+Each runner reports healthy while `Runner.Listener` is alive
+(`pgrep -f Runner.Listener`, exec form: under `CMD-SHELL` the wrapping
+`sh -c` would match its own command line). The container restarts after each
+ephemeral job; `start_period` (120 s) keeps the re-registration from counting
+as failures.
+
+## Image identity
+
+The image carries `RUNNER_IMAGE_TAG` (the fully pinned tag, e.g.
+`2.338.0-jdk21-sdk36-node24`) and `RUNNER_IMAGE_REVISION` (the commit it was
+built from) as environment variables, set from build args by `deploy.yml`
+(`build.yml` sets `pr-<number>` and the head SHA). Jobs can print them to tell
+which image they ran on. Local builds default to `dev`.
 
 ## X64 cache volumes
 
-This compose is for the **X64** class (`beelink`, `docker`, `large`). System
-labels (`Linux`, `X64`) are still applied by the runner binary; set
-`LABELS` in `.env` to `beelink,docker,large` (do not add a `build` label).
-`EPHEMERAL` stays `false` so the volumes survive between jobs.
+This compose is for the **X64** class (`beelink`, `hetzner`). The `LABELS`
+default is the beelink set; hosts override it in `.env` (see the table above).
+The runners are ephemeral, but the volumes survive between containers and
+jobs.
 
 Each runner gets its own:
 
-| Mount | Volume (runner / runner-2 / runner-3) | Why |
-|-------|----------------------------------------|-----|
-| `/tmp/runner/work` | `runner-work*` | Job workspace. Cleanup spares `$RUNNER_WORKDIR`. |
-| `/root/.bun` | `runner-bun*` | Bun install cache |
-| `/root/.npm` | `runner-npm*` | npm cache |
-| `/root/.cache/pnpm` | `runner-pnpm*` | pnpm store |
-| `/root/.gradle` | `runner-gradle*` | Gradle modules, build-cache, transforms |
-| `/root/.cargo` | `runner-cargo*` | Cargo registry |
+| Mount | Volume (runner / runner-2 / runner-3) | Why | Capped by pruner |
+|-------|----------------------------------------|-----|------------------|
+| `/tmp/runner/work` | `runner-work*` | Job workspace. Cleanup spares `$RUNNER_WORKDIR`. | no |
+| `/root/.bun` | `runner-bun*` | Bun install cache | yes |
+| `/root/.npm` | `runner-npm*` | npm cache | no |
+| `/root/.cache/pnpm` | `runner-pnpm*` | pnpm store | no |
+| `/root/.gradle` | `runner-gradle*` | Gradle modules, build-cache, transforms | yes |
+| `/root/.cargo` | `runner-cargo*` | Cargo registry | no |
+| `/root/.rustup` | `runner-rustup*` | Rust toolchains (issue #8) | no |
+| `/root/.konan` | `runner-konan*` | Kotlin/Native toolchain and dependencies | no |
+| `/root/.local/share/mise` | `runner-mise-data*` | mise tool installs (`MISE_DATA_DIR`) | yes, whole tool versions |
+| `/root/.cache/mise` | `runner-mise-cache*` | mise downloads (`MISE_CACHE_DIR`) | yes |
+| `/root/.cache/hk` | `runner-hk*` | hk cache, incl. pkl (`HK_CACHE_DIR`, `HK_PKL_CACHE_DIR`) | yes |
 
-Budget ~20 GB per runner (enforced by the post-job hook with LRU, not a
-wipe), ~60 GB per beelink. ARM64 / Pi hosts should **not** mount these
-cache volumes — those runners isolate to `RUNNER_TEMP`.
+The Dockerfile sets `MISE_DATA_DIR`, `MISE_CACHE_DIR`, `HK_CACHE_DIR` and
+`HK_PKL_CACHE_DIR` so the tools write where the volumes are mounted. The
+`~/.cache` directory is never mounted as a whole: that would shadow the pnpm
+volume, so each subdirectory has its own volume. `jdx/mise-action` should use
+`cache: false` on these runners; the volumes replace its GitHub-cache step.
+
+Budget ~20 GB per capped cache directory (enforced by the nightly pruner with
+LRU, not a wipe). The remaining volumes (npm, pnpm, cargo, rustup, konan) are
+not capped yet (issue #7 tracks the bun/gradle-only caps; hard-linked stores
+need care). ARM64 / Pi hosts should **not** mount these cache volumes — those
+runners isolate to `RUNNER_TEMP`, see `hosts/rpi5.compose.yml`.
+
+## Maintenance: per-job cleanup and the nightly pruner
+
+`cleanup.sh` (the `JOB_COMPLETED` hook) only does the cheap tidy-up after each
+job: `/tmp` outside the workdir, Gradle daemon/journals/locks, runner `_diag`
+logs. The expensive scans used to run there on every job and cost 21–39 s each
+(issue #16). They now run once a day in the `pruner` compose service, which
+uses the same image with [`pruner.sh`](pruner.sh) as its entrypoint and
+mounts only the capped cache volumes plus `docker.sock`:
+
+- LRU size caps (`CACHE_CAP_BYTES`, default 20 GiB) on gradle, bun, the mise
+  cache and the hk cache, evicting by last access time; mise installs are
+  evicted as whole `tool/version` directories so a tool is never left half
+  deleted (`MISE_DATA_CAP_BYTES`).
+- `docker system prune -af --filter until=24h`
+- `docker builder prune -af --filter until=72h`
+
+Named volumes are never pruned. The first run is 5 minutes after start
+(`PRUNE_INITIAL_DELAY`), then every `PRUNE_INTERVAL_SECONDS` (86400). Run it
+once by hand with
+`docker compose run --rm -e PRUNE_RUN_ONCE=true pruner`.
 
 Do **not** tmpfs `/tmp`. `RUNNER_WORKDIR` is `/tmp/runner/work`; a tmpfs
 or a blanket `find /tmp -delete` hides or wipes the work volume.
@@ -58,7 +161,8 @@ or a blanket `find /tmp -delete` hides or wipes the work volume.
 
 Named volumes are unused if the job relocates the caches. On these X64
 self-hosted runners, workflows must **not** isolate `GRADLE_USER_HOME` or
-`BUN_INSTALL_CACHE_DIR` (or `npm_config_cache` / `CARGO_HOME`) to
+`BUN_INSTALL_CACHE_DIR` (or `npm_config_cache` / `CARGO_HOME` /
+`MISE_DATA_DIR` / `MISE_CACHE_DIR` / `HK_CACHE_DIR`) to
 `$RUNNER_TEMP`. That is the `setup-stack` local-home mode in
 `dodi-smart/.github` — `deps-verify` stays isolated; `pr-checks` uses the
 default homes so the volumes are actually read.
@@ -180,7 +284,7 @@ docker build -f Dockerfile .
 Build args can be used to customize the image. See the top of the
 [`Dockerfile`](Dockerfile) for the current defaults and available args
 (`VERSION`, `JAVA_VERSION`, `NODE_VERSION`, `COMPILE_SDK`, `BUILD_TOOLS`,
-`NDK_VERSION`, `SDK_TOOLS`).
+`NDK_VERSION`, `SDK_TOOLS`, `RUNNER_IMAGE_TAG`, `RUNNER_IMAGE_REVISION`).
 
 Example:
 ```

@@ -1,7 +1,10 @@
-# Beelink X64 layout: three persistent runners, each with its own work and
-# cache volumes. Do not share bun/gradle/npm/cargo volumes across services —
-# concurrent jobs would corrupt the same tree. YAML merge of volumes:
-# replaces the list, so docker.sock is repeated on each service.
+# X64 runner layout (beelink by default; hetzner uses the same file with its own
+# .env, see hosts/): three runners, each with its own work and cache volumes,
+# plus a nightly `pruner`. Do not share bun/gradle/npm/cargo/mise volumes
+# across runner services - concurrent jobs would corrupt the same tree. YAML
+# merge of volumes: replaces the list, so docker.sock is repeated on each
+# service. ARM64 / rpi5 hosts layer hosts/rpi5.compose.yml on top (no heavy
+# cache volumes), see README.
 x-runner: &runner
   image: ghcr.io/dodi-smart/github-runner
   restart: unless-stopped
@@ -13,10 +16,32 @@ x-runner: &runner
     RUNNER_WORKDIR: /tmp/runner/work
     RUNNER_SCOPE: org
     ORG_NAME: ${APP_LOGIN}
-    LABELS: ${LABELS:-self-hosted,Linux,X64,beelink,docker,large}
+    LABELS: ${LABELS:-self-hosted,Linux,X64,docker,x86,large,light,beelink}
     RUNNER_GROUP: ${RUNNER_GROUP:-Default}
-    DISABLE_AUTO_UPDATE: ${DISABLE_AUTO_UPDATE:-false}
-    EPHEMERAL: "false"
+    # The upstream entrypoint only tests these with `[ -n "$VAR" ]`, so ANY
+    # non-empty value - including "false" - turns the flag on.
+    #
+    # EPHEMERAL: "true" is what these runners have always actually done: the old
+    # `EPHEMERAL: "false"` passed --ephemeral too. Each runner takes exactly one
+    # job, deregisters, exits, and `restart: unless-stopped` brings up a fresh
+    # container that registers again. That is intended: a clean container per
+    # job, while the named volumes below carry the caches across containers.
+    EPHEMERAL: "true"
+    # Empty (the default) leaves runner self-update on. Set it in .env to ANY
+    # non-empty value to disable updates; `DISABLE_AUTO_UPDATE=false` disables
+    # them too. See .env.example.
+    DISABLE_AUTO_UPDATE: ${DISABLE_AUTO_UPDATE:-}
+  # Runner.Listener is the long-lived process of a registered runner. Exec form
+  # on purpose: under CMD-SHELL the wrapping `sh -c` carries the pattern in its
+  # own command line and `pgrep -f` would match itself, healthy forever. The
+  # container restarts after every job (ephemeral), so start_period covers
+  # re-registration.
+  healthcheck:
+    test: ["CMD", "pgrep", "-f", "Runner.Listener"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 120s
   volumes:
     - /var/run/docker.sock:/var/run/docker.sock
   security_opt:
@@ -33,6 +58,11 @@ services:
       - runner-pnpm:/root/.cache/pnpm
       - runner-gradle:/root/.gradle
       - runner-cargo:/root/.cargo
+      - runner-rustup:/root/.rustup
+      - runner-konan:/root/.konan
+      - runner-mise-data:/root/.local/share/mise
+      - runner-mise-cache:/root/.cache/mise
+      - runner-hk:/root/.cache/hk
   runner-2:
     <<: *runner
     volumes:
@@ -43,6 +73,11 @@ services:
       - runner-pnpm-2:/root/.cache/pnpm
       - runner-gradle-2:/root/.gradle
       - runner-cargo-2:/root/.cargo
+      - runner-rustup-2:/root/.rustup
+      - runner-konan-2:/root/.konan
+      - runner-mise-data-2:/root/.local/share/mise
+      - runner-mise-cache-2:/root/.cache/mise
+      - runner-hk-2:/root/.cache/hk
   runner-3:
     <<: *runner
     volumes:
@@ -53,6 +88,45 @@ services:
       - runner-pnpm-3:/root/.cache/pnpm
       - runner-gradle-3:/root/.gradle
       - runner-cargo-3:/root/.cargo
+      - runner-rustup-3:/root/.rustup
+      - runner-konan-3:/root/.konan
+      - runner-mise-data-3:/root/.local/share/mise
+      - runner-mise-cache-3:/root/.cache/mise
+      - runner-hk-3:/root/.cache/hk
+  # Nightly maintenance, off the job path (issue #16: the same scans inside the
+  # per-job cleanup.sh cost 21-39 s on every job). Same image, pruner.sh as the
+  # entrypoint. It needs only the caches it caps (not work/npm/pnpm/...), and
+  # docker.sock to prune the host daemon: `docker system prune -af --filter
+  # until=24h` and `docker builder prune -af --filter until=72h`. Named volumes
+  # are never pruned. Tunables: PRUNE_INTERVAL_SECONDS, CACHE_CAP_BYTES, ...
+  # (see pruner.sh).
+  pruner:
+    image: ghcr.io/dodi-smart/github-runner
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/pruner.sh"]
+    environment:
+      CACHES_ROOT: /caches
+      CACHE_CAP_BYTES: ${CACHE_CAP_BYTES:-21474836480}
+      PRUNE_INTERVAL_SECONDS: ${PRUNE_INTERVAL_SECONDS:-86400}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner-gradle:/caches/1/gradle
+      - runner-bun:/caches/1/bun
+      - runner-mise-cache:/caches/1/mise-cache
+      - runner-hk:/caches/1/hk
+      - runner-mise-data:/caches/1/mise-data
+      - runner-gradle-2:/caches/2/gradle
+      - runner-bun-2:/caches/2/bun
+      - runner-mise-cache-2:/caches/2/mise-cache
+      - runner-hk-2:/caches/2/hk
+      - runner-mise-data-2:/caches/2/mise-data
+      - runner-gradle-3:/caches/3/gradle
+      - runner-bun-3:/caches/3/bun
+      - runner-mise-cache-3:/caches/3/mise-cache
+      - runner-hk-3:/caches/3/hk
+      - runner-mise-data-3:/caches/3/mise-data
+    security_opt:
+      - label:disable
 
 volumes:
   runner-work: {}
@@ -73,3 +147,18 @@ volumes:
   runner-cargo: {}
   runner-cargo-2: {}
   runner-cargo-3: {}
+  runner-rustup: {}
+  runner-rustup-2: {}
+  runner-rustup-3: {}
+  runner-konan: {}
+  runner-konan-2: {}
+  runner-konan-3: {}
+  runner-mise-data: {}
+  runner-mise-data-2: {}
+  runner-mise-data-3: {}
+  runner-mise-cache: {}
+  runner-mise-cache-2: {}
+  runner-mise-cache-3: {}
+  runner-hk: {}
+  runner-hk-2: {}
+  runner-hk-3: {}

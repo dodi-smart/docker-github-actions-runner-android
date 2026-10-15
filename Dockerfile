@@ -101,11 +101,28 @@ LABEL maintainer="asen.lekov@dodi.li"
 # the only other option, `safe.directory=*`, turns the check off for everything.
 ENV TAR_OPTIONS=--no-same-owner
 
+# Tool caches that outlive a job. Jobs run as root (HOME=/root), so these are
+# the tools' own defaults made explicit: docker-compose.yml mounts one named
+# volume on each of them. Mount the specific directories, never ~/.cache as a
+# whole, or it would shadow the pnpm volume at ~/.cache/pnpm.
+#   - mise: tool installs (data) and downloads (cache). jdx/mise-action and
+#     `mise install` fill these.
+#   - hk: HK_CACHE_DIR is its config/tool cache. HK_PKL_CACHE_DIR defaults to
+#     ~/.cache/pklr, a sibling of ~/.cache/hk, so it is pinned underneath
+#     HK_CACHE_DIR to live on the same volume.
+ENV MISE_DATA_DIR=/root/.local/share/mise \
+    MISE_CACHE_DIR=/root/.cache/mise \
+    HK_CACHE_DIR=/root/.cache/hk \
+    HK_PKL_CACHE_DIR=/root/.cache/hk/pklr
+
 # Job hooks: JOB_STARTED is the poison sweep (covers OOM / killed runner);
 # JOB_COMPLETED is the tidy-up. Neither wipes package / Gradle caches.
 COPY pre-job.sh /usr/local/bin/pre-job.sh
 COPY cleanup.sh /usr/local/bin/cleanup.sh
-RUN chmod +x /usr/local/bin/pre-job.sh /usr/local/bin/cleanup.sh
+# pruner.sh is not a hook: the `pruner` compose service runs it nightly
+# (LRU cache caps + docker prune), keeping those scans off the job path.
+COPY pruner.sh /usr/local/bin/pruner.sh
+RUN chmod +x /usr/local/bin/pre-job.sh /usr/local/bin/cleanup.sh /usr/local/bin/pruner.sh
 ENV ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/pre-job.sh
 ENV ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/cleanup.sh
 
@@ -117,6 +134,15 @@ ENV ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/cleanup.sh
 # registration happens instead. See preflight-entrypoint.sh for details.
 COPY preflight-entrypoint.sh /usr/local/bin/preflight-entrypoint.sh
 RUN chmod +x /usr/local/bin/preflight-entrypoint.sh
+# Image identity. deploy.yml passes the image tag and the commit it was built
+# from; jobs read them (e.g. the runner report) to tell which image they ran
+# on. They default to "dev" for local builds. Declared last: the values change
+# on every build, so anything after them would never hit the layer cache.
+ARG RUNNER_IMAGE_TAG=dev
+ARG RUNNER_IMAGE_REVISION=dev
+ENV RUNNER_IMAGE_TAG=$RUNNER_IMAGE_TAG \
+    RUNNER_IMAGE_REVISION=$RUNNER_IMAGE_REVISION
+
 ENTRYPOINT ["/usr/local/bin/preflight-entrypoint.sh"]
 # Declaring ENTRYPOINT resets the CMD inherited from the base image, so the
 # base image's CMD is restated here. See

@@ -78,6 +78,8 @@ jobs:
             VERSION=${{ steps.versions.outputs.runner_tag }}
             JAVA_VERSION=${{ matrix.java_version }}
             NODE_VERSION=${{ matrix.node_version }}
+            RUNNER_IMAGE_TAG=pr-${{ github.event.pull_request.number }}
+            RUNNER_IMAGE_REVISION=${{ github.event.pull_request.head.sha }}
 
   gate:
     name: All builds passed
