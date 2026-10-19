@@ -6,7 +6,9 @@
 # 21-39 s of runner time each time and freeing nothing (issue #16). Here they
 # run once a day, off the job path:
 #   1. LRU size caps on the per-runner cache volumes (mounted under
-#      $CACHES_ROOT/<runner>/<name>, see docker-compose.yml).
+#      $CACHES_ROOT/<runner>/<name>, see docker-compose.yml). Caches whose
+#      entries are only valid whole (bun packages, mise tool versions) evict
+#      whole entries; the rest evict single files.
 #   2. docker system prune / builder prune on the host daemon (docker.sock).
 #   3. Hourly, in the background: fill the shared action archive cache.
 #
@@ -79,7 +81,7 @@ lru_cap() {
     rec="${rec#*	}"        # drop atime
     fsize="${rec%%	*}"
     path="${rec#*	}"
-    [ -n "$path" ] && [ -n "$fsize" ] || continue
+    if [ -z "$path" ] || [ -z "$fsize" ]; then continue; fi
     rm -f "$path" 2>/dev/null || true
     freed=$((freed + fsize))
   done < <(find "$dir" -type f -printf '%A@\t%s\t%p\0' 2>/dev/null | sort -z -n)
@@ -108,6 +110,49 @@ lru_cap_mise_installs() {
   log "$installs freed ~${freed}B"
 }
 
+# bun treats install/cache/<pkg>@<ver>@@@<n>/ as complete whenever the folder
+# exists, so a file evicted from it is silently missing from every later
+# node_modules (next@16.3.8 lost dist/compiled/server-only/empty.js, breaking
+# every Next build). 0-byte files went first: copying them never reads, so
+# their atime never moved. Evict whole package folders instead, least recently
+# used first by the atime of their package.json (read on every install and
+# import), until the whole volume ($1, mounted from /root/.bun) fits under the
+# cap. Never touches $1/bin (the bun binary itself) or the @t@ manifest piles.
+lru_cap_bun() {
+  local dir="$1" cap="${2:-$CACHE_CAP_BYTES}"
+  local cache="$dir/install/cache"
+  local excess freed=0 rec path dsize base t
+  [ -d "$cache" ] || return 0
+  # Leftovers of interrupted extractions; the age guard spares live installs.
+  find "$cache" -mindepth 1 -maxdepth 2 ! -name .tmp \( -name '*.tmp' -o -name '*.part' \) \
+    -mmin +60 -exec rm -rf {} + 2>/dev/null
+  find "$cache/.tmp" -mindepth 1 -maxdepth 1 -mmin +60 -exec rm -rf {} + 2>/dev/null
+  excess=$(excess_bytes "$dir" "$cap") || return 0
+  log "evicting least recently used packages from $cache"
+  while IFS= read -r -d '' rec; do
+    [ "$freed" -ge "$excess" ] && break
+    path="${rec#*	}"
+    [ -d "$path" ] || continue
+    dsize=$(dir_bytes "$path")
+    rm -rf "$path" 2>/dev/null || true
+    freed=$((freed + ${dsize:-0}))
+    # Drop the <pkg>/<ver>@@@<n> symlink pointing at it, and the dir if empty.
+    base="${path##*/}"
+    rm -f "${path%/*}/${base%%@*}/${base#*@}" 2>/dev/null
+    rmdir "${path%/*}/${base%%@*}" 2>/dev/null
+  done < <(
+    # <pkg>@<ver>... at the top level, @scope/<pkg>@<ver>... one level down.
+    find "$cache" -mindepth 1 -maxdepth 2 -type d -name '*@*' ! -name '@*' \
+      \( -path "$cache/@*/*" -o ! -path "$cache/*/*" \) -print0 2>/dev/null |
+      while IFS= read -r -d '' path; do
+        t=$(stat -c %X "$path/package.json" 2>/dev/null || stat -c %Y "$path" 2>/dev/null) || continue
+        printf '%s\t%s\0' "$t" "$path"
+      done | sort -z -n
+  )
+  find "$cache" -mindepth 1 -maxdepth 1 -name '@*' ! -name '@t@' -type d -empty -delete 2>/dev/null || true
+  log "$cache freed ~${freed}B"
+}
+
 prune_caches() {
   local runner
   for runner in "$CACHES_ROOT"/*/; do
@@ -115,9 +160,9 @@ prune_caches() {
     runner="${runner%/}"
     log "capping caches under $runner"
     lru_cap "$runner/gradle"
-    lru_cap "$runner/bun"
+    lru_cap_bun "$runner/bun"
     lru_cap "$runner/mise-cache"
-    lru_cap "$runner/hk"
+    lru_cap "$runner/hk" # configs/<hash>.json + pklr/packages/<hash>.zip: whole files
     lru_cap_mise_installs "$runner/mise-data"
   done
   lru_cap "$ACTION_CACHE_DIR" "$ACTION_CACHE_CAP_BYTES"
@@ -146,8 +191,11 @@ prefetch_one() {
   local name="$1" ref="$2" sha="$2" dir file tmp
   dir="$ACTION_CACHE_DIR/${name//\//_}"
   if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
-    sha=$(gh_curl -H 'Accept: application/vnd.github.sha' "$GITHUB_API/repos/$name/commits/$ref") &&
-      [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { log "prefetch: cannot resolve $name@$ref" >&2; return 1; }
+    sha=$(gh_curl -H 'Accept: application/vnd.github.sha' "$GITHUB_API/repos/$name/commits/$ref")
+    if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+      log "prefetch: cannot resolve $name@$ref" >&2
+      return 1
+    fi
   fi
   file="$dir/$sha.tar.gz"
   [ -s "$file" ] && return 0
@@ -191,7 +239,7 @@ prefetch_actions() {
   refs=$(sort -u "$work/refs")
   rm -rf "$work"
   while read -r name ref; do
-    [ -n "$name" ] && [ -n "$ref" ] || continue
+    if [ -z "$name" ] || [ -z "$ref" ]; then continue; fi
     n=$((n + 1))
     if out=$(prefetch_one "$name" "$ref"); then
       [ "$out" = 1 ] && fetched=$((fetched + 1))
@@ -224,6 +272,9 @@ run_once() {
   after=$(df -h / | awk 'NR==2 {print $4}')
   log "done. Disk free: ${before} -> ${after}"
 }
+
+# Sourced (tests/): define the functions only.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 
 if [ "${1:-}" = prefetch ]; then
   prefetch_actions
