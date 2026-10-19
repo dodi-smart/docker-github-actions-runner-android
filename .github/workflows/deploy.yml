@@ -12,6 +12,7 @@ jobs:
   matrix:
     name: Generate build matrix
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       build_matrix: ${{ steps.generate.outputs.build_matrix }}
       merge_matrix: ${{ steps.generate.outputs.merge_matrix }}
@@ -22,24 +23,35 @@ jobs:
         id: generate
         run: |
           set -euo pipefail
+          # Every JDK x Node pair is published as the `runner` target. The
+          # default pair is additionally published as `runner-ndk` (the same
+          # image plus the NDK); it is a separate "variant" so its digests,
+          # cache scope and tags never mix with the standard image.
           ALL=$(jq -c '
             .default_jdk as $dj | .default_node as $dn
             | [ .java_versions[] as $j | .node_versions[] as $n |
                 { java_version: $j, node_version: $n,
                   is_default_jdk:  ($j == $dj),
-                  is_default_node: ($n == $dn) } ] as $combos
+                  is_default_node: ($n == $dn),
+                  variant: "std", target: "runner", ndk: false, tag_suffix: "" } ] as $std
+            | ( [ $std[] | select(.is_default_jdk and .is_default_node)
+                  | . + {variant: "ndk", target: "runner-ndk", ndk: true, tag_suffix: "-ndk"} ] ) as $ndk
+            | ( $std + $ndk ) as $combos
             | { build: { include: [
                   $combos[] as $c |
-                  ($c + {platform: "linux/amd64", arch: "amd64", runner: "ubuntu-latest"}),
-                  ($c + {platform: "linux/arm64", arch: "arm64", runner: "ubuntu-24.04-arm"}) ] },
+                  ($c + {platform: "linux/amd64", arch: "amd64", runner: "ubuntu-latest",
+                         cache_scope: (if $c.ndk then "ndk-amd64" else "amd64" end)}),
+                  ($c + {platform: "linux/arm64", arch: "arm64", runner: "ubuntu-24.04-arm",
+                         cache_scope: (if $c.ndk then "ndk-arm64" else "arm64" end)}) ] },
                 merge: { include: $combos } }' matrix.json)
-          echo "build_matrix=$(jq -c .build  <<< "$ALL")" >> $GITHUB_OUTPUT
-          echo "merge_matrix=$(jq -c .merge <<< "$ALL")" >> $GITHUB_OUTPUT
+          echo "build_matrix=$(jq -c .build  <<< "$ALL")" >> "$GITHUB_OUTPUT"
+          echo "merge_matrix=$(jq -c .merge <<< "$ALL")" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build ${{ matrix.platform }} JDK ${{ matrix.java_version }} Node ${{ matrix.node_version }}
+    name: Build ${{ matrix.platform }} JDK ${{ matrix.java_version }} Node ${{ matrix.node_version }}${{ matrix.tag_suffix }}
     needs: matrix
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.matrix.outputs.build_matrix) }}
@@ -59,9 +71,11 @@ jobs:
             exit 1
           fi
 
-          echo "runner_tag=${RUNNER_TAG}" >> $GITHUB_OUTPUT
-          echo "runner_version=${RUNNER_VERSION}" >> $GITHUB_OUTPUT
-          echo "compile_sdk=${COMPILE_SDK}" >> $GITHUB_OUTPUT
+          {
+            echo "runner_tag=${RUNNER_TAG}"
+            echo "runner_version=${RUNNER_VERSION}"
+            echo "compile_sdk=${COMPILE_SDK}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
@@ -82,14 +96,21 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/github-runner
           tags: |
-            type=raw,value=${{ steps.versions.outputs.runner_version }}-jdk${{ matrix.java_version }}-sdk${{ steps.versions.outputs.compile_sdk }}-node${{ matrix.node_version }}
+            type=raw,value=${{ steps.versions.outputs.runner_version }}-jdk${{ matrix.java_version }}-sdk${{ steps.versions.outputs.compile_sdk }}-node${{ matrix.node_version }}${{ matrix.tag_suffix }}
 
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
+          target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
+          # Layer cache in the GitHub Actions cache, one scope per platform
+          # (the NDK variant keeps its own scope and reads the standard one).
+          cache-from: |
+            type=gha,scope=${{ matrix.arch }}
+            type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
           # Disable SLSA provenance: it wraps the image in a per-registry
           # attestation index which produces unknown/unknown manifest entries
           # and an extra attestation manifest per arch. Nothing in this
@@ -114,15 +135,16 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v7
         with:
-          name: digests-jdk${{ matrix.java_version }}-node${{ matrix.node_version }}-${{ matrix.arch }}
+          name: digests-${{ matrix.variant }}-jdk${{ matrix.java_version }}-node${{ matrix.node_version }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
   merge:
-    name: Merge JDK ${{ matrix.java_version }} Node ${{ matrix.node_version }}
+    name: Merge JDK ${{ matrix.java_version }} Node ${{ matrix.node_version }}${{ matrix.tag_suffix }}
     needs: [matrix, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.matrix.outputs.merge_matrix) }}
@@ -142,13 +164,13 @@ jobs:
             exit 1
           fi
 
-          echo "runner_version=${RUNNER_VERSION}" >> $GITHUB_OUTPUT
-          echo "compile_sdk=${COMPILE_SDK}" >> $GITHUB_OUTPUT
+          echo "runner_version=${RUNNER_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "compile_sdk=${COMPILE_SDK}" >> "$GITHUB_OUTPUT"
 
       - name: Download digests
         uses: actions/download-artifact@v8
         with:
-          pattern: digests-jdk${{ matrix.java_version }}-node${{ matrix.node_version }}-*
+          pattern: digests-${{ matrix.variant }}-jdk${{ matrix.java_version }}-node${{ matrix.node_version }}-*
           merge-multiple: true
           path: ${{ runner.temp }}/digests
 
@@ -168,11 +190,12 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/github-runner
           tags: |
-            type=raw,value=jdk${{ matrix.java_version }},enable=${{ matrix.is_default_node }}
-            type=raw,value=node${{ matrix.node_version }},enable=${{ matrix.is_default_jdk }}
-            type=raw,value=jdk${{ matrix.java_version }}-node${{ matrix.node_version }}
-            type=raw,value=${{ steps.versions.outputs.runner_version }}-jdk${{ matrix.java_version }}-sdk${{ steps.versions.outputs.compile_sdk }}-node${{ matrix.node_version }}
-            type=raw,value=latest,enable=${{ matrix.is_default_jdk && matrix.is_default_node }}
+            type=raw,value=jdk${{ matrix.java_version }},enable=${{ !matrix.ndk && matrix.is_default_node }}
+            type=raw,value=node${{ matrix.node_version }},enable=${{ !matrix.ndk && matrix.is_default_jdk }}
+            type=raw,value=jdk${{ matrix.java_version }}-node${{ matrix.node_version }},enable=${{ !matrix.ndk }}
+            type=raw,value=${{ steps.versions.outputs.runner_version }}-jdk${{ matrix.java_version }}-sdk${{ steps.versions.outputs.compile_sdk }}-node${{ matrix.node_version }}${{ matrix.tag_suffix }}
+            type=raw,value=latest,enable=${{ !matrix.ndk && matrix.is_default_jdk && matrix.is_default_node }}
+            type=raw,value=ndk,enable=${{ matrix.ndk }}
 
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
@@ -183,6 +206,8 @@ jobs:
           TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           # Source: one per arch, by digest, from the GHCR push in the build job.
           SOURCES=$(printf "${IMAGE}@sha256:%s " *)
+          # TAGS and SOURCES are deliberately word-split into arguments.
+          # shellcheck disable=SC2086
           docker buildx imagetools create $TAGS $SOURCES
 
           for tag in $(jq -cr '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON"); do
