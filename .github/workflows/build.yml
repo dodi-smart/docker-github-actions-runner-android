@@ -23,7 +23,7 @@ jobs:
           # nullglob: a pattern that matches nothing (e.g. hosts/*.sh) must
           # drop out instead of being passed to shellcheck as a literal.
           shopt -s nullglob
-          files=(*.sh hosts/*.sh tests/*.sh)
+          files=(*.sh hosts/*.sh tests/*.sh tests/bench/*.sh)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "::error::No shell scripts found to check"
             exit 1

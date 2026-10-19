@@ -66,7 +66,7 @@ DOCKER_BUILDER_PRUNE_UNTIL="${DOCKER_BUILDER_PRUNE_UNTIL:-72h}"
 
 log() { echo "[pruner] $(date -u +%FT%TZ) $*"; }
 
-# Evictable units per store, one rule per line: store|kind|glob|skip
+# Evictable units per store, one rule per line: store|kind|glob|skip|opts
 #   kind d: every directory matching glob (relative to the store dir, never a
 #           symlink) is one unit, removed whole; skip is a case pattern for the
 #           relative path of units to leave alone. Glob "." makes the whole
@@ -74,40 +74,44 @@ log() { echo "[pruner] $(date -u +%FT%TZ) $*"; }
 #           emptied, but its subdirs are kept, as container symlinks point there.
 #   kind f: every regular file named skip (a find -name pattern) under the dir
 #           glob is one unit.
+#   opts:   comma-separated. shared: not a runner-slot store (the action archive
+#           cache). key=<file>: LRU order of a dir unit is the atime of <unit>/<file>
+#           (the unit's mtime when it has none), not the newest atime of any file.
+# Globs use * and ? only; like the shell, they skip names starting with a dot.
 # Anything no rule matches (bun's bin/ and @t@ piles, cargo's bin/ and registry
-# index, rustup's settings.toml, ...) is never touched. Hooks for the few stores
-# needing more than a rule are in unit_key / unit_protected / unit_pre_evict /
-# unit_post_evict. Leftovers of killed bun extractions (*.tmp, *.part) are
-# pre-job.sh's job: it sweeps them before the next job of a crashed slot.
+# index, rustup's settings.toml, ...) is never touched. The few stores needing
+# more than a rule are in store_hook. Leftovers of killed bun extractions
+# (*.tmp, *.part) are pre-job.sh's job: it sweeps them before the next job of a
+# crashed slot.
 STORE_TABLE='
-bun|d|install/cache/*@*|install/cache/@*
-bun|d|install/cache/@*/*@*|install/cache/@t@/*
-npm|f|_cacache|*
-pnpm|d|.|
-gradle|d|caches/modules-2/files-2.1/*/*/*|
-gradle|d|caches/transforms-*/*|
-gradle|d|wrapper/dists/*|
-gradle|d|caches/jars-*/*|
-gradle|f|caches/build-cache-1|*
-cargo|f|registry/cache|*.crate
-cargo|d|registry/src/*/*|
-cargo|d|git/checkouts/*|
-cargo|d|git/db/*|
-rustup|d|toolchains/*|
-konan|d|dependencies/*|
-konan|d|kotlin-native-prebuilt-*|
-mise-data|d|installs/*/*|
-pub|d|hosted/*/*|
-pub|d|git/*|
-toolcache|d|*/*|
-mise-cache|f|.|*
-hk|f|.|*
-actions|f|.|*
+bun|d|install/cache/*@*|install/cache/@*|key=package.json
+bun|d|install/cache/@*/*@*|install/cache/@t@/*|key=package.json
+npm|f|_cacache|*|
+pnpm|d|.||
+gradle|d|caches/modules-2/files-2.1/*/*/*||
+gradle|d|caches/transforms-*/*||
+gradle|d|wrapper/dists/*||
+gradle|d|caches/jars-*/*||
+gradle|f|caches/build-cache-1|*|
+cargo|f|registry/cache|*.crate|
+cargo|d|registry/src/*/*||
+cargo|d|git/checkouts/*||
+cargo|d|git/db/*||
+rustup|d|toolchains/*||
+konan|d|dependencies/*||
+konan|d|kotlin-native-prebuilt-*||
+mise-data|d|installs/*/*||
+pub|d|hosted/*/*||
+pub|d|git/*||
+toolcache|d|*/*||
+mise-cache|f|.|*|
+hk|f|.|*|
+actions|f|.|*|shared
 '
 
 # Stores of a runner slot (everything but the shared action archive cache).
 slot_stores() {
-  awk -F'|' 'NF > 3 && $1 != "actions" && !seen[$1]++ {print $1}' <<<"$STORE_TABLE"
+  awk -F'|' 'NF > 3 && $5 !~ /(^|,)shared(,|$)/ && !seen[$1]++ {print $1}' <<<"$STORE_TABLE"
 }
 
 dir_bytes() {
@@ -119,57 +123,132 @@ rustup_default() {
   sed -n 's/^default_toolchain[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$1/settings.toml" 2>/dev/null | head -n 1
 }
 
+# The per-store behaviour a table rule cannot express: store_hook <phase> <store> <args>.
+#   protect <store> <store dir>   prints the names of units never to evict, one
+#                                 per line (a unit named N or N-* is kept)
+#   pre     <store> <unit path>   before a dir unit is removed
+#   post    <store> <unit path>   after it is gone
+store_hook() {
+  local base
+  case "$1:$2" in
+    # `stable` is the dir stable-<host triple>, hence the N-* match.
+    protect:rustup) rustup_default "$3" ;;
+    # <ver>/<arch>.complete says <ver>/<arch> is whole. Drop the markers first
+    # so an interrupted removal never leaves a "complete" half tree.
+    pre:toolcache) find "$3" -mindepth 1 -maxdepth 1 -name '*.complete' -delete 2>/dev/null ;;
+    # Drop the <pkg>/<ver>@@@<n> symlink pointing at the unit, and the dir if empty.
+    post:bun)
+      base="${3##*/}"
+      rm -f "${3%/*}/${base%%@*}/${base#*@}" 2>/dev/null
+      rmdir "${3%/*}/${base%%@*}" 2>/dev/null
+      ;;
+  esac
+  return 0
+}
+
 # bun treats install/cache/<pkg>@<ver>@@@<n>/ as complete whenever the folder
 # exists, so a file evicted from it is silently missing from every later
 # node_modules (next@16.3.8 lost dist/compiled/server-only/empty.js, breaking
 # every Next build). 0-byte files went first: copying them never reads, so
 # their atime never moved. Hence whole packages, least recently used first by
-# the atime of their package.json (read on every install and import).
+# the atime of their package.json (read on every install and import): the
+# key=package.json option of the bun rules.
 
-# LRU key override for dir unit $2 of store $1; prints nothing to keep the
-# newest-atime-of-any-file key.
-unit_key() {
-  [ "$1" = bun ] || return 0
-  stat -c %X "$2/package.json" 2>/dev/null || stat -c %Y "$2" 2>/dev/null
+# awk program of collect_units. Input: find lines "%P\t%y\t%A@\t%T@\t%s\t%d"
+# (path below the rule's prefix, type, atime, mtime, size, depth). Variables:
+# store, sd (store dir), pre (rule prefix), glob (rule glob below pre), depth
+# (its component count), skip (case pattern on the path below sd), keyfile (see
+# key= in STORE_TABLE), protect (names never evicted, one per line).
+# mawk compatible (this is Ubuntu's default awk): no gensub, no NUL in strings.
+# shellcheck disable=SC2016  # awk program, not shell
+UNITS_AWK='
+# Shell glob (* and ? only; a leading dot is never matched) as an anchored regex.
+function glob_re(g,   i, ch, out, start) {
+  out = "^"; start = 1
+  for (i = 1; i <= length(g); i++) {
+    ch = substr(g, i, 1)
+    if (ch == "*") out = out (start ? "([^./][^/]*)?" : "[^/]*")
+    else if (ch == "?") out = out (start ? "[^./]" : "[^/]")
+    else if (index(".+(){}|^$[]\\", ch)) out = out "\\" ch
+    else out = out ch
+    start = (ch == "/")
+  }
+  return out "$"
 }
-
-# Succeeds when unit $3 (relative to dir $2 of store $1) must not be evicted.
-unit_protected() {
-  local def
-  [ "$1" = rustup ] || return 1
-  def=$(rustup_default "$2")
-  [ -n "$def" ] || return 1
-  case "${3##*/}" in
-    "$def" | "$def"-*) return 0 ;; # `stable` is the dir stable-<host triple>
-  esac
-  return 1
+# `case` pattern (* matches / too) as an anchored regex.
+function case_re(g,   i, ch, out) {
+  out = "^"
+  for (i = 1; i <= length(g); i++) {
+    ch = substr(g, i, 1)
+    if (ch == "*") out = out ".*"
+    else if (ch == "?") out = out "."
+    else if (index(".+(){}|^$[]\\", ch)) out = out "\\" ch
+    else out = out ch
+  }
+  return out "$"
 }
-
-# toolcache: <ver>/<arch>.complete says <ver>/<arch> is whole. Drop the markers
-# first so an interrupted removal never leaves a "complete" half tree.
-unit_pre_evict() {
-  [ "$1" = toolcache ] || return 0
-  find "$2" -mindepth 1 -maxdepth 1 -name '*.complete' -delete 2>/dev/null
+function flush(   key) {
+  if (cur == "") return
+  key = keyfile == "" ? maxf : (keyat != "" ? keyat : mtime)
+  printf "%.6f\t%.0f\t%s\t%s\t%s%c", key, size, store, stop, sd "/" rel, 0
+  cur = ""
 }
-
-# After unit $2 of store $1 is gone.
-unit_post_evict() {
-  local base
-  [ "$1" = bun ] || return 0
-  # Drop the <pkg>/<ver>@@@<n> symlink pointing at it, and the dir if empty.
-  base="${2##*/}"
-  rm -f "${2%/*}/${base%%@*}/${base#*@}" 2>/dev/null
-  rmdir "${2%/*}/${base%%@*}" 2>/dev/null
+function protected(rel,   base, i) {
+  base = rel; sub(/^.*\//, "", base)
+  for (i = 1; i <= nprot; i++)
+    if (prot[i] != "" && (base == prot[i] || index(base, prot[i] "-") == 1)) return 1
   return 0
 }
+BEGIN {
+  FS = "\t"
+  root = (glob == ".")
+  if (root) depth = 0
+  gre = glob_re(glob)
+  sre = skip == "" ? "" : case_re(skip)
+  nprot = split(protect, prot, "\n")
+  stop = sd (pre == "" ? "" : "/" pre)
+}
+NF != 6 { next }
+{
+  d = $6 + 0
+  if (d > depth) {  # below the unit level: part of the current unit, if any
+    if (cur == "") next
+    if (!root && substr($1, 1, plen) != cp) next
+    size += $5
+    if ($2 == "f") {
+      if ($3 + 0 > maxf) maxf = $3 + 0
+      if (keyfile != "" && $1 == cp keyfile) keyat = $3
+    }
+    next
+  }
+  flush()
+  if (d < depth || $2 != "d") next
+  if (!root && $1 !~ gre) next
+  rel = root ? "." : (pre == "" ? $1 : pre "/" $1)
+  if (sre != "" && rel ~ sre) next
+  if (protected(rel)) next
+  cur = rel; cp = $1 "/"; plen = length(cp)
+  if (root) cp = ""
+  size = $5; maxf = 0; keyat = ""; mtime = $4
+}
+END { flush() }
+'
 
 # Print NUL-terminated "key<TAB>size<TAB>store<TAB>stop<TAB>path" records, one
 # per evictable unit of store $1 living in dir $2. key is the LRU order (atime,
 # seconds); stop is the dir above which emptied parents are not removed.
+#
+# One find per dir rule lists everything below the rule's fixed prefix, and one
+# awk turns that listing into units. A unit sits at a fixed depth (the glob's
+# component count) and find lists a directory right before its contents, so a
+# unit's size, newest file atime and package.json atime are summed up as the
+# lines go by: no per-unit process.
 collect_units() {
-  local store="$1" sd="$2" s kind glob skip pre stop
+  local store="$1" sd="$2" s kind glob skip opts pre rest key protect
+  local -a parts
   [ -d "$sd" ] || return 0
-  while IFS='|' read -r s kind glob skip; do
+  protect=$(store_hook protect "$store" "$sd")
+  while IFS='|' read -r s kind glob skip opts; do
     [ "$s" = "$store" ] || continue
     if [ "$kind" = f ]; then
       [ -d "$sd/$glob" ] || continue
@@ -181,24 +260,15 @@ collect_units() {
       */*) pre="${pre%/*}" ;;
       *) pre="" ;;
     esac
-    stop="$sd${pre:+/$pre}"
-    (
-      cd "$sd" 2>/dev/null || exit 0
-      shopt -s nullglob
-      # shellcheck disable=SC2086  # glob expansion is the point
-      for rel in $glob; do
-        if [ ! -d "$rel" ] || [ -L "$rel" ]; then continue; fi
-        # shellcheck disable=SC2254  # skip is a pattern
-        case "$rel" in $skip) continue ;; esac
-        if unit_protected "$store" "$sd" "$rel"; then continue; fi
-        stats=$(find "$rel" -printf '%y\t%A@\t%s\n' 2>/dev/null |
-          awk -F'\t' '{ s += $3; if ($1 == "f" && $2 + 0 > m) m = $2 + 0 } END { printf "%.6f\t%.0f\n", m, s }')
-        key="${stats%%$'\t'*}"
-        t=$(unit_key "$store" "$rel")
-        [ -z "$t" ] || key="$t"
-        printf '%s\t%s\t%s\t%s\t%s\0' "$key" "${stats#*$'\t'}" "$store" "$stop" "$sd/$rel"
-      done
-    )
+    rest="${glob#"$pre"}"
+    rest="${rest#/}"
+    IFS=/ read -ra parts <<<"$rest"
+    key=""
+    case ",$opts," in *,key=*) key="${opts#*key=}"; key="${key%%,*}" ;; esac
+    [ -d "$sd${pre:+/$pre}" ] || continue
+    find "$sd${pre:+/$pre}" -printf '%P\t%y\t%A@\t%T@\t%s\t%d\n' 2>/dev/null |
+      awk -F'\t' -v store="$store" -v sd="$sd" -v pre="$pre" -v glob="$rest" -v depth="${#parts[@]}" \
+        -v skip="$skip" -v keyfile="$key" -v protect="$protect" "$UNITS_AWK"
   done <<<"$STORE_TABLE"
 }
 
@@ -210,9 +280,9 @@ evict_unit() {
     find "${path%/.}" -mindepth 2 -delete 2>/dev/null
     find "${path%/.}" -mindepth 1 -maxdepth 1 ! -type d -delete 2>/dev/null
   elif [ -d "$path" ] && [ ! -L "$path" ]; then
-    unit_pre_evict "$store" "$path"
+    store_hook pre "$store" "$path"
     rm -rf "$path" 2>/dev/null
-    unit_post_evict "$store" "$path"
+    store_hook post "$store" "$path"
     p="${path%/*}"
     while [ "$p" != "$stop" ] && [ "${p#"$stop"/}" != "$p" ]; do
       rmdir "$p" 2>/dev/null || break
