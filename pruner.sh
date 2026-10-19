@@ -81,7 +81,7 @@ lru_cap() {
     rec="${rec#*	}"        # drop atime
     fsize="${rec%%	*}"
     path="${rec#*	}"
-    [ -n "$path" ] && [ -n "$fsize" ] || continue
+    if [ -z "$path" ] || [ -z "$fsize" ]; then continue; fi
     rm -f "$path" 2>/dev/null || true
     freed=$((freed + fsize))
   done < <(find "$dir" -type f -printf '%A@\t%s\t%p\0' 2>/dev/null | sort -z -n)
@@ -191,8 +191,11 @@ prefetch_one() {
   local name="$1" ref="$2" sha="$2" dir file tmp
   dir="$ACTION_CACHE_DIR/${name//\//_}"
   if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
-    sha=$(gh_curl -H 'Accept: application/vnd.github.sha' "$GITHUB_API/repos/$name/commits/$ref") &&
-      [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { log "prefetch: cannot resolve $name@$ref" >&2; return 1; }
+    sha=$(gh_curl -H 'Accept: application/vnd.github.sha' "$GITHUB_API/repos/$name/commits/$ref")
+    if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+      log "prefetch: cannot resolve $name@$ref" >&2
+      return 1
+    fi
   fi
   file="$dir/$sha.tar.gz"
   [ -s "$file" ] && return 0
@@ -236,7 +239,7 @@ prefetch_actions() {
   refs=$(sort -u "$work/refs")
   rm -rf "$work"
   while read -r name ref; do
-    [ -n "$name" ] && [ -n "$ref" ] || continue
+    if [ -z "$name" ] || [ -z "$ref" ]; then continue; fi
     n=$((n + 1))
     if out=$(prefetch_one "$name" "$ref"); then
       [ "$out" = 1 ] && fetched=$((fetched + 1))
