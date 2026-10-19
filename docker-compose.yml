@@ -1,46 +1,63 @@
-# Three ephemeral runners, each with its own work and cache volumes, plus a
-# `pruner` for maintenance. Never share a cache volume between runners:
-# concurrent jobs would corrupt it. The action archive cache is the exception:
-# read-only in every runner, filled by the pruner. `volumes:` lists replace on
-# merge, so docker.sock is repeated per service. Small hosts can layer
-# hosts/no-caches.compose.yml on top (see README).
-# The environment is its own anchor so a service can change one key (LABELS)
-# without restating the rest: a `<<:` merge replaces a whole mapping, so
-# `environment:` in a service would otherwise drop every other variable.
+# RUNNERS ephemeral runners, CONTROL_RUNNERS coordination runners and a
+# `pruner` for maintenance. Size a host by setting RUNNERS in .env
+# (hosts/sizing.sh suggests a value); there is nothing per runner to copy.
+#
+# State lives in one host directory, RUNNER_DATA_DIR, bind-mounted at the SAME
+# path inside every container. On start each container claims a free slot,
+# RUNNER_DATA_DIR/slots/<id>, with a lock it holds for its whole life (see
+# preflight-entrypoint.sh), and keeps its work dir and caches there:
+#   slots/<id>/work           RUNNER_WORKDIR. The same path on the host, so the
+#                             `docker run -v` / container actions a job hands
+#                             to the host daemon see the checkout (issue #19).
+#   slots/<id>/cache/<store>  bun, npm, pnpm, gradle, cargo, rustup, konan,
+#                             mise, hk, pub and the hosted tool cache; the
+#                             default home paths (/root/.bun, ...) link here.
+# One slot per running container, so no two concurrent jobs share a cache.
+# The action archive cache is the only shared state: read-only in the
+# runners, filled by the pruner.
 x-runner-env: &runner-env
-    APP_ID: ${APP_ID}
-    APP_PRIVATE_KEY: ${APP_PRIVATE_KEY}
-    APP_LOGIN: ${APP_LOGIN}
-    RUNNER_NAME_PREFIX: ${RUNNER_NAME_PREFIX:-runner}
-    RUNNER_WORKDIR: /tmp/runner/work
-    RUNNER_SCOPE: org
-    ORG_NAME: ${APP_LOGIN}
-    LABELS: ${LABELS:-docker}
-    RUNNER_GROUP: ${RUNNER_GROUP:-Default}
-    # The upstream entrypoint only tests these with `[ -n "$VAR" ]`, so ANY
-    # non-empty value - including "false" - turns the flag on.
-    #
-    # EPHEMERAL: "true" is what these runners have always actually done: the old
-    # `EPHEMERAL: "false"` passed --ephemeral too. Each runner takes exactly one
-    # job, deregisters, exits, and `restart: unless-stopped` brings up a fresh
-    # container that registers again. That is intended: a clean container per
-    # job, while the named volumes below carry the caches across containers.
-    EPHEMERAL: "true"
-    # Empty (the default) leaves runner self-update on. Set it in .env to ANY
-    # non-empty value to disable updates; `DISABLE_AUTO_UPDATE=false` disables
-    # them too. See .env.example.
-    DISABLE_AUTO_UPDATE: ${DISABLE_AUTO_UPDATE:-}
-    # Ephemeral runners re-download every action archive for every job, and the
-    # few public IPs of these hosts hit codeload.github.com's 429 limit. The
-    # runner (>= 2.319) reads <dir>/<owner>_<repo>/<sha>.tar.gz before it
-    # downloads, and only reads: the `pruner` service fills the shared
-    # runner-action-cache volume (see pruner.sh), mounted read-only below.
-    ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE: /opt/actionarchivecache
+  APP_ID: ${APP_ID}
+  APP_PRIVATE_KEY: ${APP_PRIVATE_KEY}
+  APP_LOGIN: ${APP_LOGIN}
+  RUNNER_NAME_PREFIX: ${RUNNER_NAME_PREFIX:-runner}
+  RUNNER_SCOPE: org
+  ORG_NAME: ${APP_LOGIN}
+  LABELS: ${LABELS:-docker}
+  RUNNER_GROUP: ${RUNNER_GROUP:-Default}
+  RUNNER_DATA_DIR: ${RUNNER_DATA_DIR:-/var/lib/github-runner}
+  RUNNER_CACHES: ${RUNNER_CACHES:-on}
+  # The upstream entrypoint only tests these with `[ -n "$VAR" ]`, so ANY
+  # non-empty value - including "false" - turns the flag on.
+  #
+  # Each runner takes exactly one job, deregisters, exits, and
+  # `restart: unless-stopped` starts it again to register afresh. The slot's
+  # caches carry over; /tmp and the job's leftovers do not (cleanup.sh).
+  EPHEMERAL: "true"
+  # Empty (the default) leaves runner self-update on. Set it in .env to ANY
+  # non-empty value to disable updates; `DISABLE_AUTO_UPDATE=false` disables
+  # them too. See .env.example.
+  DISABLE_AUTO_UPDATE: ${DISABLE_AUTO_UPDATE:-}
+  # Ephemeral runners re-download every action archive for every job, and the
+  # few public IPs of these hosts hit codeload.github.com's 429 limit. The
+  # runner (>= 2.319) reads <dir>/<owner>_<repo>/<sha>.tar.gz before it
+  # downloads, and only reads: the `pruner` service fills the shared
+  # runner-action-cache volume (see pruner.sh), mounted read-only below.
+  ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE: /opt/actionarchivecache
 
 x-runner: &runner
   image: ${RUNNER_IMAGE:-ghcr.io/dodi-smart/github-runner}
   restart: unless-stopped
+  # .env is passed whole, so RUNNER_<id>_LABELS works for any slot id without
+  # listing each one here. Optional, so `docker compose config` runs without it.
+  env_file:
+    - path: .env
+      required: false
   environment: *runner-env
+  # Optional per-runner limits (hosts/sizing.sh suggests them; 0 = none). With
+  # a CPU limit the preflight sizes Gradle/cargo/make/cmake parallelism to it,
+  # so runners sharing a host don't each spawn a worker per host CPU.
+  cpus: ${RUNNER_CPUS:-0}
+  mem_limit: ${RUNNER_MEMORY:-0}
   # Runner.Listener is the long-lived process of a registered runner. Exec form
   # on purpose: under CMD-SHELL the wrapping `sh -c` carries the pattern in its
   # own command line and `pgrep -f` would match itself, healthy forever. The
@@ -54,167 +71,58 @@ x-runner: &runner
     start_period: 120s
   volumes:
     - /var/run/docker.sock:/var/run/docker.sock
+    - ${RUNNER_DATA_DIR:-/var/lib/github-runner}:${RUNNER_DATA_DIR:-/var/lib/github-runner}
+    - runner-action-cache:/opt/actionarchivecache:ro
   security_opt:
     - label:disable
 
-# Coordination runners carry only CONTROL_LABELS (default `control`), never a
-# work label, so no build or test can land on them: they exist so the short
-# jobs a merge waits on (a picker, a required summary) never queue behind long
-# work. Those jobs read the API and check nothing out, so each service mounts
-# no docker.sock and no tool cache, only its work directory and the read-only
-# action cache.
-x-control: &control
-  <<: *runner
-  profiles: [control]
-  environment:
-    <<: *runner-env
-    LABELS: ${CONTROL_LABELS:-control}
-    RUNNER_NAME_PREFIX: ${RUNNER_NAME_PREFIX:-runner}-control
-
 services:
-  # Each runner registers with the host's LABELS, or with RUNNER_<N>_LABELS when
-  # that is set: one runner of a host can then join another pool (a `large`
-  # runner on a host whose others stay `light`) without a second host file.
+  # Slots 1..RUNNERS. Each registers with the host's LABELS, or with
+  # RUNNER_<id>_LABELS when that is set: one runner of a host can then join
+  # another pool (a `large` runner on a host whose others stay `light`).
   runner:
     <<: *runner
-    environment:
-      <<: *runner-env
-      LABELS: ${RUNNER_1_LABELS:-${LABELS:-docker}}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - runner-work:/tmp/runner/work
-      - runner-bun:/root/.bun
-      - runner-npm:/root/.npm
-      - runner-pnpm:/root/.cache/pnpm
-      - runner-gradle:/root/.gradle
-      - runner-cargo:/root/.cargo
-      - runner-rustup:/root/.rustup
-      - runner-konan:/root/.konan
-      - runner-mise-data:/root/.local/share/mise
-      - runner-mise-cache:/root/.cache/mise
-      - runner-hk:/root/.cache/hk
-      - runner-action-cache:/opt/actionarchivecache:ro
-  runner-2:
-    <<: *runner
-    environment:
-      <<: *runner-env
-      LABELS: ${RUNNER_2_LABELS:-${LABELS:-docker}}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - runner-work-2:/tmp/runner/work
-      - runner-bun-2:/root/.bun
-      - runner-npm-2:/root/.npm
-      - runner-pnpm-2:/root/.cache/pnpm
-      - runner-gradle-2:/root/.gradle
-      - runner-cargo-2:/root/.cargo
-      - runner-rustup-2:/root/.rustup
-      - runner-konan-2:/root/.konan
-      - runner-mise-data-2:/root/.local/share/mise
-      - runner-mise-cache-2:/root/.cache/mise
-      - runner-hk-2:/root/.cache/hk
-      - runner-action-cache:/opt/actionarchivecache:ro
-  runner-3:
-    <<: *runner
-    environment:
-      <<: *runner-env
-      LABELS: ${RUNNER_3_LABELS:-${LABELS:-docker}}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - runner-work-3:/tmp/runner/work
-      - runner-bun-3:/root/.bun
-      - runner-npm-3:/root/.npm
-      - runner-pnpm-3:/root/.cache/pnpm
-      - runner-gradle-3:/root/.gradle
-      - runner-cargo-3:/root/.cargo
-      - runner-rustup-3:/root/.rustup
-      - runner-konan-3:/root/.konan
-      - runner-mise-data-3:/root/.local/share/mise
-      - runner-mise-cache-3:/root/.cache/mise
-      - runner-hk-3:/root/.cache/hk
-      - runner-action-cache:/opt/actionarchivecache:ro
-  # Coordination runners (see x-control), off unless COMPOSE_PROFILES=control.
+    deploy:
+      replicas: ${RUNNERS:-3}
+
+  # Coordination runners carry only CONTROL_LABELS (default `control`), never a
+  # work label, so no build or test can land on them: they exist so the short
+  # jobs a merge waits on (a picker, a required summary) never queue behind long
+  # work. Those jobs read the API and check nothing out, so they get no
+  # docker.sock and no tool caches (slots c1..cN, work dir only).
   control:
-    <<: *control
+    <<: *runner
+    deploy:
+      replicas: ${CONTROL_RUNNERS:-0}
+    environment:
+      <<: *runner-env
+      LABELS: ${CONTROL_LABELS:-control}
+      RUNNER_NAME_PREFIX: ${RUNNER_NAME_PREFIX:-runner}-control
+      RUNNER_SLOT_PREFIX: c
+      RUNNER_CACHES: "off"
     volumes:
-      - runner-work-control:/tmp/runner/work
+      - ${RUNNER_DATA_DIR:-/var/lib/github-runner}:${RUNNER_DATA_DIR:-/var/lib/github-runner}
       - runner-action-cache:/opt/actionarchivecache:ro
-  control-2:
-    <<: *control
-    volumes:
-      - runner-work-control-2:/tmp/runner/work
-      - runner-action-cache:/opt/actionarchivecache:ro
-  # Maintenance off the job path (pruner.sh): nightly cache caps and docker
-  # prune, hourly action-cache fill. Mounts only what it caps.
+
+  # Maintenance off the job path (pruner.sh): cache budgets per slot and docker
+  # prune, plus the hourly action-cache fill.
   pruner:
     image: ${RUNNER_IMAGE:-ghcr.io/dodi-smart/github-runner}
     restart: unless-stopped
     entrypoint: ["/usr/local/bin/pruner.sh"]
+    env_file:
+      - path: .env
+        required: false
+    # .env (env_file above) brings the App credentials it prefetches actions
+    # with and every pruner tunable.
     environment:
-      CACHES_ROOT: /caches
-      APP_ID: ${APP_ID} # App token for authenticated action downloads
-      APP_PRIVATE_KEY: ${APP_PRIVATE_KEY}
-      APP_LOGIN: ${APP_LOGIN}
-      ACTION_CACHE_CAP_BYTES: ${ACTION_CACHE_CAP_BYTES:-2147483648}
-      PREFETCH_SOURCES: ${PREFETCH_SOURCES:-}
-      PREFETCH_EXTRA: ${PREFETCH_EXTRA:-}
-      PREFETCH_INTERVAL_SECONDS: ${PREFETCH_INTERVAL_SECONDS:-3600}
-      CACHE_CAP_BYTES: ${CACHE_CAP_BYTES:-21474836480}
-      PRUNE_INTERVAL_SECONDS: ${PRUNE_INTERVAL_SECONDS:-86400}
+      RUNNER_DATA_DIR: ${RUNNER_DATA_DIR:-/var/lib/github-runner}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - runner-gradle:/caches/1/gradle
-      - runner-bun:/caches/1/bun
-      - runner-mise-cache:/caches/1/mise-cache
-      - runner-hk:/caches/1/hk
-      - runner-mise-data:/caches/1/mise-data
-      - runner-gradle-2:/caches/2/gradle
-      - runner-bun-2:/caches/2/bun
-      - runner-mise-cache-2:/caches/2/mise-cache
-      - runner-hk-2:/caches/2/hk
-      - runner-mise-data-2:/caches/2/mise-data
-      - runner-gradle-3:/caches/3/gradle
-      - runner-bun-3:/caches/3/bun
-      - runner-mise-cache-3:/caches/3/mise-cache
-      - runner-hk-3:/caches/3/hk
-      - runner-mise-data-3:/caches/3/mise-data
+      - ${RUNNER_DATA_DIR:-/var/lib/github-runner}:${RUNNER_DATA_DIR:-/var/lib/github-runner}
       - runner-action-cache:/opt/actionarchivecache
     security_opt:
       - label:disable
 
 volumes:
   runner-action-cache: {} # read-only in runners, filled by the pruner
-  runner-work: {}
-  runner-work-2: {}
-  runner-work-3: {}
-  runner-work-control: {}
-  runner-work-control-2: {}
-  runner-bun: {}
-  runner-bun-2: {}
-  runner-bun-3: {}
-  runner-npm: {}
-  runner-npm-2: {}
-  runner-npm-3: {}
-  runner-pnpm: {}
-  runner-pnpm-2: {}
-  runner-pnpm-3: {}
-  runner-gradle: {}
-  runner-gradle-2: {}
-  runner-gradle-3: {}
-  runner-cargo: {}
-  runner-cargo-2: {}
-  runner-cargo-3: {}
-  runner-rustup: {}
-  runner-rustup-2: {}
-  runner-rustup-3: {}
-  runner-konan: {}
-  runner-konan-2: {}
-  runner-konan-3: {}
-  runner-mise-data: {}
-  runner-mise-data-2: {}
-  runner-mise-data-3: {}
-  runner-mise-cache: {}
-  runner-mise-cache-2: {}
-  runner-mise-cache-3: {}
-  runner-hk: {}
-  runner-hk-2: {}
-  runner-hk-3: {}
