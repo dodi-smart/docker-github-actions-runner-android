@@ -5,25 +5,41 @@ on:
     - cron: '0 9 * * 1' # Weekly on Monday at 9 AM UTC
   workflow_dispatch:
 
+# Writes (branch push, PR, auto-merge) go through the GitHub App token minted
+# below, not GITHUB_TOKEN: PRs opened with GITHUB_TOKEN never trigger
+# build.yml, so their required checks would never report.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   check-updates:
     name: Check for updates
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - uses: actions/checkout@v7
+        with:
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Check for new JDK versions
         id: jdk
         run: |
-          # Get available Temurin releases >= 17
+          # Get available Temurin GA releases >= 17
           RESPONSE=$(curl -sf https://api.adoptium.net/v3/info/available_releases || echo "")
           if [ -z "$RESPONSE" ]; then
             echo "Failed to fetch Adoptium releases API"
-            echo "has_new=false" >> $GITHUB_OUTPUT
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -41,12 +57,12 @@ jobs:
             fi
           done
 
-          echo "new_versions=${NEW_VERSIONS}" >> $GITHUB_OUTPUT
+          echo "new_versions=${NEW_VERSIONS}" >> "$GITHUB_OUTPUT"
           if [ -n "$NEW_VERSIONS" ]; then
-            echo "has_new=true" >> $GITHUB_OUTPUT
+            echo "has_new=true" >> "$GITHUB_OUTPUT"
             echo "Found new JDK versions: $NEW_VERSIONS"
           else
-            echo "has_new=false" >> $GITHUB_OUTPUT
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
             echo "No new JDK versions found"
           fi
 
@@ -61,7 +77,7 @@ jobs:
           # which falsely includes long-EOL majors (10, 12, 14, 16, 18).
           if ! SCHEDULE=$(curl -sf https://raw.githubusercontent.com/nodejs/Release/main/schedule.json); then
             echo "Failed to fetch Node release schedule"
-            echo "has_new=false" >> $GITHUB_OUTPUT
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -88,12 +104,12 @@ jobs:
             fi
           done
 
-          echo "new_versions=${NEW_VERSIONS}" >> $GITHUB_OUTPUT
+          echo "new_versions=${NEW_VERSIONS}" >> "$GITHUB_OUTPUT"
           if [ -n "$NEW_VERSIONS" ]; then
-            echo "has_new=true" >> $GITHUB_OUTPUT
+            echo "has_new=true" >> "$GITHUB_OUTPUT"
             echo "Found new Node LTS versions: $NEW_VERSIONS"
           else
-            echo "has_new=false" >> $GITHUB_OUTPUT
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
             echo "No new Node LTS versions found"
           fi
 
@@ -107,12 +123,12 @@ jobs:
           # are listed too), which then break the unattended Docker build when
           # sdkmanager demands the separate Android SDK Preview license. The manifest
           # carries reliable preview markers, so we parse it with a real XML parser
-          # and skip any package that is obsolete, carries a non-empty <codename>, or
-          # uses the android-sdk-preview-license. Stable platforms since android-37.0
-          # carry an EMPTY <codename></codename>, so only a non-empty one marks a preview.
+          # and skip any package that is obsolete, carries a non-empty <codename>
+          # (stable platforms have an empty one), or uses the
+          # android-sdk-preview-license.
           if ! wget -q "https://dl.google.com/android/repository/repository2-3.xml" -O /tmp/android-repo.xml; then
             echo "Failed to download SDK repository manifest"
-            echo "updated=false" >> $GITHUB_OUTPUT
+            echo "updated=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if ! SDK_VERSIONS=$(python3 - /tmp/android-repo.xml <<'PY'
@@ -127,6 +143,9 @@ jobs:
               if pkg.get('obsolete') == 'true':
                   return True
               for e in pkg.iter():
+                  # Stable platforms carry an *empty* <codename></codename>
+                  # (e.g. android-37.0/37.1/37.2); previews name the next
+                  # release there (DEV, CinnamonBun, ...).
                   if local(e.tag) == 'codename' and (e.text or '').strip():
                       return True
                   if local(e.tag) == 'uses-license' and e.get('ref') == 'android-sdk-preview-license':
@@ -160,7 +179,7 @@ jobs:
           PY
           ); then
             echo "Failed to parse SDK repository manifest"
-            echo "updated=false" >> $GITHUB_OUTPUT
+            echo "updated=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           eval "$SDK_VERSIONS"
@@ -170,12 +189,14 @@ jobs:
           CURRENT_BUILD_TOOLS=$(grep '^ARG BUILD_TOOLS=' Dockerfile | cut -d= -f2)
           CURRENT_NDK=$(grep '^ARG NDK_VERSION=' Dockerfile | cut -d= -f2)
 
-          echo "latest_platform=${LATEST_PLATFORM}" >> $GITHUB_OUTPUT
-          echo "latest_build_tools=${LATEST_BUILD_TOOLS}" >> $GITHUB_OUTPUT
-          echo "latest_ndk=${LATEST_NDK}" >> $GITHUB_OUTPUT
-          echo "current_platform=${CURRENT_PLATFORM}" >> $GITHUB_OUTPUT
-          echo "current_build_tools=${CURRENT_BUILD_TOOLS}" >> $GITHUB_OUTPUT
-          echo "current_ndk=${CURRENT_NDK}" >> $GITHUB_OUTPUT
+          {
+            echo "latest_platform=${LATEST_PLATFORM}"
+            echo "latest_build_tools=${LATEST_BUILD_TOOLS}"
+            echo "latest_ndk=${LATEST_NDK}"
+            echo "current_platform=${CURRENT_PLATFORM}"
+            echo "current_build_tools=${CURRENT_BUILD_TOOLS}"
+            echo "current_ndk=${CURRENT_NDK}"
+          } >> "$GITHUB_OUTPUT"
 
           # Check if updates are needed
           UPDATED=false
@@ -192,7 +213,7 @@ jobs:
             UPDATED=true
           fi
 
-          echo "updated=${UPDATED}" >> $GITHUB_OUTPUT
+          echo "updated=${UPDATED}" >> "$GITHUB_OUTPUT"
           echo "SDK check results:"
           echo "  Platform: ${CURRENT_PLATFORM} -> ${LATEST_PLATFORM}"
           echo "  Build tools: ${CURRENT_BUILD_TOOLS} -> ${LATEST_BUILD_TOOLS}"
@@ -200,13 +221,23 @@ jobs:
 
       - name: Apply JDK updates
         if: steps.jdk.outputs.has_new == 'true'
+        env:
+          NEW_VERSIONS: ${{ steps.jdk.outputs.new_versions }}
         run: |
-          for v in ${{ steps.jdk.outputs.new_versions }}; do
-            jq --arg v "$v" '.java_versions += [$v] | .java_versions = (.java_versions | sort_by(tonumber))' matrix.json > tmp.json && mv tmp.json matrix.json
+          for v in $NEW_VERSIONS; do
+            jq --arg v "$v" '.java_versions += [$v]' matrix.json > tmp.json && mv tmp.json matrix.json
           done
 
-          # Update default to highest version
-          jq '.default_jdk = (.java_versions | sort_by(tonumber) | last)' matrix.json > tmp.json && mv tmp.json matrix.json
+          # Retention policy: keep the LTS lines (17, 21, 25, then one every
+          # two years: 29, 33, ...) plus the newest GA release, and drop any
+          # other non-LTS version once it is no longer the newest. The default
+          # is always the newest.
+          jq '
+            def lts: . >= 17 and ((. - 17) % 4 == 0);
+            ([.java_versions[] | tonumber] | unique) as $all
+            | ($all | max) as $newest
+            | .java_versions = [ $all[] | select(. == $newest or lts) | tostring ]
+            | .default_jdk = (.java_versions | last)' matrix.json > tmp.json && mv tmp.json matrix.json
 
           echo "Updated matrix.json:"
           cat matrix.json
@@ -239,7 +270,7 @@ jobs:
       - name: Create pull request
         if: steps.jdk.outputs.has_new == 'true' || steps.sdk.outputs.updated == 'true' || steps.node.outputs.has_new == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           BRANCH="automated/sdk-jdk-updates"
 
@@ -261,7 +292,7 @@ jobs:
             MSG="$MSG SDK"
           fi
           MSG="$MSG versions"
-          git commit -m "$MSG"
+          git commit -m "chore(deps): $MSG"
           git push -f origin "$BRANCH"
 
           # Build PR body
@@ -302,15 +333,13 @@ jobs:
           EXISTING=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null || true)
           if [ -z "$EXISTING" ]; then
             gh pr create \
-              --title "Update SDK/JDK/Node versions" \
+              --title "chore(deps): update SDK/JDK/Node versions" \
               --body-file /tmp/pr-body.txt \
               --head "$BRANCH"
           else
             echo "PR #${EXISTING} already exists, updated with force push"
           fi
 
-          # No auto-merge on purpose: this PR is opened with GITHUB_TOKEN, and GitHub
-          # does not trigger workflows for PRs created that way. build.yml never runs,
-          # so the "All builds passed" check never reports and an auto-merge request
-          # would hang forever. Merge manually (which runs the builds), or add a
-          # fine-grained PAT and restore upstream's auto-merge step.
+          # The PR is opened with the App token, so build.yml runs and the
+          # "All builds passed" check reports; auto-merge waits for it.
+          gh pr merge --auto --squash "$BRANCH"
