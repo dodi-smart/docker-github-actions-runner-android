@@ -16,36 +16,73 @@ jobs:
     outputs:
       build_matrix: ${{ steps.generate.outputs.build_matrix }}
       merge_matrix: ${{ steps.generate.outputs.merge_matrix }}
+      runner_tag: ${{ steps.versions.outputs.runner_tag }}
     steps:
       - uses: actions/checkout@v7
 
+      # The only place the Dockerfile is read: the build jobs take the VERSION
+      # build-arg from this job's outputs, and every image tag is computed here,
+      # per matrix entry.
+      - name: Extract versions from Dockerfile
+        id: versions
+        run: |
+          set -euo pipefail
+          RUNNER_TAG=$(grep -m1 '^ARG VERSION=' Dockerfile | cut -d= -f2)
+          RUNNER_VERSION=$(echo "$RUNNER_TAG" | cut -d- -f1)
+          COMPILE_SDK=$(grep -m1 '^ARG COMPILE_SDK=' Dockerfile | cut -d= -f2)
+          BUILD_TOOLS=$(grep -m1 '^ARG BUILD_TOOLS=' Dockerfile | cut -d= -f2)
+          NDK_VERSION=$(grep -m1 '^ARG NDK_VERSION=' Dockerfile | cut -d= -f2)
+
+          if [ -z "$RUNNER_TAG" ] || [ -z "$RUNNER_VERSION" ] || [ -z "$COMPILE_SDK" ] || [ -z "$BUILD_TOOLS" ] || [ -z "$NDK_VERSION" ]; then
+            echo "::error::Failed to extract versions from Dockerfile"
+            exit 1
+          fi
+
+          {
+            echo "runner_tag=${RUNNER_TAG}"
+            echo "runner_version=${RUNNER_VERSION}"
+            echo "compile_sdk=${COMPILE_SDK}"
+            echo "build_tools=${BUILD_TOOLS}"
+            echo "ndk_version=${NDK_VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Generate matrices from matrix.json
         id: generate
+        env:
+          RUNNER_VERSION: ${{ steps.versions.outputs.runner_version }}
+          COMPILE_SDK: ${{ steps.versions.outputs.compile_sdk }}
+          BUILD_TOOLS: ${{ steps.versions.outputs.build_tools }}
+          NDK_VERSION: ${{ steps.versions.outputs.ndk_version }}
         run: |
           set -euo pipefail
           # Every JDK x Node pair is published as the `runner` target (variant
           # "std"). The default pair is additionally published as `runner-ndk`
           # (the image plus the NDK) and `runner-slim` (no Android SDK). Each
           # variant has its own digests, cache scope and tags so they never mix
-          # with the standard image.
-          ALL=$(jq -c '
-            .default_jdk as $dj | .default_node as $dn
-            | [ .java_versions[] as $j | .node_versions[] as $n |
-                { java_version: $j, node_version: $n,
-                  is_default_jdk:  ($j == $dj),
-                  is_default_node: ($n == $dn),
-                  variant: "std", target: "runner" } ] as $std
-            | ( [ $std[] | select(.is_default_jdk and .is_default_node) ] ) as $default_pair
-            | ( [ $default_pair[] | . + {variant: "ndk",  target: "runner-ndk"} ]
-              + [ $default_pair[] | . + {variant: "slim", target: "runner-slim"} ] ) as $extra
-            | ( $std + $extra ) as $combos
+          # with the standard image. The variant/platform/cache-scope table is
+          # shared with build.yml (.github/jq/matrix.jq); the tag rules are in
+          # .github/jq/tags.jq. A build entry carries the tag baked into the
+          # image, a merge entry the metadata-action `type=raw` lines of the
+          # manifest list.
+          ALL=$(jq -c -L .github/jq \
+            --arg runner_version "$RUNNER_VERSION" --arg compile_sdk "$COMPILE_SDK" \
+            --arg build_tools "$BUILD_TOOLS" --arg ndk_version "$NDK_VERSION" '
+            include "matrix"; include "tags";
+            {runner_version: $runner_version, compile_sdk: $compile_sdk,
+             build_tools: $build_tools, ndk_version: $ndk_version} as $v
+            | .default_jdk as $dj | .default_node as $dn
+            | [ .java_versions[] as $j | .node_versions[] as $n
+                | {java_version: $j, node_version: $n, variant: "std"} ] as $std
+            | ( $std
+                + [ $std[] | select(.java_version == $dj and .node_version == $dn)
+                    | (. + {variant: "ndk"}), (. + {variant: "slim"}) ] ) as $images
             | { build: { include: [
-                  $combos[] as $c |
-                  ($c + {platform: "linux/amd64", arch: "amd64", runner: "ubuntu-latest",
-                         cache_scope: (if $c.variant == "std" then "amd64" else "\($c.variant)-amd64" end)}),
-                  ($c + {platform: "linux/arm64", arch: "arm64", runner: "ubuntu-24.04-arm",
-                         cache_scope: (if $c.variant == "std" then "arm64" else "\($c.variant)-arm64" end)}) ] },
-                merge: { include: $combos } }' matrix.json)
+                  $images[] as $i | ("amd64", "arm64") as $arch
+                  | leg($i.java_version; $i.node_version; $i.variant; $arch)
+                    + {image_tag: ($i | image_tag($v))} ] },
+                merge: { include: [
+                  $images[]
+                  | . + {tags: (tags($v; $dj; $dn) | map("type=raw,value=" + .) | join("\n"))} ] } }' matrix.json)
           echo "build_matrix=$(jq -c .build  <<< "$ALL")" >> "$GITHUB_OUTPUT"
           echo "merge_matrix=$(jq -c .merge <<< "$ALL")" >> "$GITHUB_OUTPUT"
 
@@ -60,26 +97,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Extract versions from Dockerfile
-        id: versions
-        run: |
-          set -euo pipefail
-          RUNNER_TAG=$(grep -m1 '^ARG VERSION=' Dockerfile | cut -d= -f2)
-          RUNNER_VERSION=$(echo "$RUNNER_TAG" | cut -d- -f1)
-          COMPILE_SDK=$(grep -m1 '^ARG COMPILE_SDK=' Dockerfile | cut -d= -f2)
-
-          if [ -z "$RUNNER_TAG" ] || [ -z "$RUNNER_VERSION" ] || [ -z "$COMPILE_SDK" ]; then
-            echo "::error::Failed to extract versions from Dockerfile"
-            exit 1
-          fi
-
-          # build_tools / ndk_version are only needed for the merge job's tags.
-          {
-            echo "runner_tag=${RUNNER_TAG}"
-            echo "runner_version=${RUNNER_VERSION}"
-            echo "compile_sdk=${COMPILE_SDK}"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
         with:
@@ -89,18 +106,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
-
-      # Image identity baked into the image as RUNNER_IMAGE_TAG /
-      # RUNNER_IMAGE_REVISION (Dockerfile ARG -> ENV). The tag is the fully
-      # pinned one, which never changes meaning; the revision is the commit.
-      - name: Docker metadata (image identity)
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/github-runner
-          tags: |
-            type=raw,value=${{ steps.versions.outputs.runner_version }}-jdk${{ matrix.java_version }}-sdk${{ steps.versions.outputs.compile_sdk }}-node${{ matrix.node_version }}${{ matrix.variant == 'ndk' && '-ndk' || '' }},enable=${{ matrix.variant != 'slim' }}
-            type=raw,value=${{ steps.versions.outputs.runner_version }}-jdk${{ matrix.java_version }}-node${{ matrix.node_version }}-slim,enable=${{ matrix.variant == 'slim' }}
 
       - name: Build and push by digest
         id: build
@@ -121,11 +126,13 @@ jobs:
           # pipeline consumes the provenance, and turning it off keeps the
           # registry view to just amd64 + arm64.
           provenance: false
+          # RUNNER_IMAGE_TAG is the fully pinned tag, which never changes meaning;
+          # the revision is the commit.
           build-args: |
-            VERSION=${{ steps.versions.outputs.runner_tag }}
+            VERSION=${{ needs.matrix.outputs.runner_tag }}
             JAVA_VERSION=${{ matrix.java_version }}
             NODE_VERSION=${{ matrix.node_version }}
-            RUNNER_IMAGE_TAG=${{ steps.meta.outputs.version }}
+            RUNNER_IMAGE_TAG=${{ matrix.image_tag }}
             RUNNER_IMAGE_REVISION=${{ github.sha }}
           # zstd layers pull and decompress faster on small hosts (Raspberry Pi) than gzip.
           # force-compression recompresses cached/base layers too; oci-mediatypes is
@@ -156,30 +163,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.matrix.outputs.merge_matrix) }}
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Extract versions from Dockerfile
-        id: versions
-        run: |
-          set -euo pipefail
-          RUNNER_TAG=$(grep -m1 '^ARG VERSION=' Dockerfile | cut -d= -f2)
-          RUNNER_VERSION=$(echo "$RUNNER_TAG" | cut -d- -f1)
-          COMPILE_SDK=$(grep -m1 '^ARG COMPILE_SDK=' Dockerfile | cut -d= -f2)
-          BUILD_TOOLS=$(grep -m1 '^ARG BUILD_TOOLS=' Dockerfile | cut -d= -f2)
-          NDK_VERSION=$(grep -m1 '^ARG NDK_VERSION=' Dockerfile | cut -d= -f2)
-
-          if [ -z "$RUNNER_TAG" ] || [ -z "$RUNNER_VERSION" ] || [ -z "$COMPILE_SDK" ] || [ -z "$BUILD_TOOLS" ] || [ -z "$NDK_VERSION" ]; then
-            echo "::error::Failed to extract versions from Dockerfile"
-            exit 1
-          fi
-
-          {
-            echo "runner_version=${RUNNER_VERSION}"
-            echo "compile_sdk=${COMPILE_SDK}"
-            echo "build_tools=${BUILD_TOOLS}"
-            echo "ndk_version=${NDK_VERSION}"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Download digests
         uses: actions/download-artifact@v8
         with:
@@ -202,23 +185,7 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/github-runner
-          tags: |
-            type=raw,value=jdk${{ matrix.java_version }},enable=${{ matrix.variant == 'std' && matrix.is_default_node }}
-            type=raw,value=node${{ matrix.node_version }},enable=${{ matrix.variant == 'std' && matrix.is_default_jdk }}
-            type=raw,value=jdk${{ matrix.java_version }}-node${{ matrix.node_version }},enable=${{ matrix.variant == 'std' }}
-            type=raw,value=${{ steps.versions.outputs.runner_version }}-jdk${{ matrix.java_version }}-sdk${{ steps.versions.outputs.compile_sdk }}-node${{ matrix.node_version }},enable=${{ matrix.variant == 'std' }}
-            # Every Gradle-pinnable SDK component in the tag (compileSdk, build-tools), so
-            # consumers can let Renovate derive them from the image pin.
-            type=raw,value=${{ steps.versions.outputs.runner_version }}-jdk${{ matrix.java_version }}-sdk${{ steps.versions.outputs.compile_sdk }}-bt${{ steps.versions.outputs.build_tools }}-node${{ matrix.node_version }},enable=${{ matrix.variant == 'std' }}
-            type=raw,value=latest,enable=${{ matrix.variant == 'std' && matrix.is_default_jdk && matrix.is_default_node }}
-            type=raw,value=ndk,enable=${{ matrix.variant == 'ndk' }}
-            type=raw,value=${{ steps.versions.outputs.runner_version }}-jdk${{ matrix.java_version }}-sdk${{ steps.versions.outputs.compile_sdk }}-node${{ matrix.node_version }}-ndk,enable=${{ matrix.variant == 'ndk' }}
-            # Only the ndk variant ships an NDK, so only it spells the NDK version out
-            # (upstream's -sdk-ndk- and -sdk-bt-ndk- tags; Gradle ndkVersion via Renovate).
-            type=raw,value=${{ steps.versions.outputs.runner_version }}-jdk${{ matrix.java_version }}-sdk${{ steps.versions.outputs.compile_sdk }}-ndk${{ steps.versions.outputs.ndk_version }}-node${{ matrix.node_version }},enable=${{ matrix.variant == 'ndk' }}
-            type=raw,value=${{ steps.versions.outputs.runner_version }}-jdk${{ matrix.java_version }}-sdk${{ steps.versions.outputs.compile_sdk }}-bt${{ steps.versions.outputs.build_tools }}-ndk${{ steps.versions.outputs.ndk_version }}-node${{ matrix.node_version }},enable=${{ matrix.variant == 'ndk' }}
-            type=raw,value=slim,enable=${{ matrix.variant == 'slim' }}
-            type=raw,value=${{ steps.versions.outputs.runner_version }}-jdk${{ matrix.java_version }}-node${{ matrix.node_version }}-slim,enable=${{ matrix.variant == 'slim' }}
+          tags: ${{ matrix.tags }}
 
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
