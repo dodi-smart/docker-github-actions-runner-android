@@ -154,7 +154,13 @@ Images are published to `ghcr.io/dodi-smart/github-runner`.
 | `jdk21` | JDK major |
 | `node22` | Node major |
 | `jdk21-node22` | JDK and Node majors |
-| `2.338.0-jdk21-sdk36-node24` | Everything: runner, JDK, SDK and Node. Never overwritten |
+| `2.338.0-jdk21-sdk37.2-node24` | Everything: runner, JDK, SDK and Node. Never overwritten |
+| `2.338.0-jdk21-sdk37.2-ndk30.0.16248370-node24` | Same image, NDK spelled out |
+| `2.338.0-jdk21-sdk37.2-bt37.0.0-ndk30.0.16248370-node24` | Same image, build-tools and NDK spelled out |
+
+The longer tags let a consumer have Renovate derive its Gradle `compileSdk`,
+`buildToolsVersion` and `ndkVersion` from the image pin, so AGP doesn't download
+SDK components on every job.
 
 [`matrix.json`](matrix.json) lists the available JDK and Node versions and the
 defaults. Each image sets `RUNNER_IMAGE_TAG` and `RUNNER_IMAGE_REVISION`, so a
