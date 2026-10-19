@@ -79,7 +79,9 @@ fi
 # Evictable units per store, one rule per line: store|kind|glob|skip
 #   kind d: every directory matching glob (relative to the store dir, never a
 #           symlink) is one unit, removed whole; skip is a case pattern for the
-#           relative path of units to leave alone.
+#           relative path of units to leave alone. Glob "." makes the whole
+#           store dir one unit (pnpm: store/ + cache/ are all-or-nothing); it is
+#           emptied, but its subdirs are kept, as container symlinks point there.
 #   kind f: every regular file named skip (a find -name pattern) under the dir
 #           glob is one unit.
 # Anything no rule matches (bun's bin/ and @t@ piles, cargo's bin/ and registry
@@ -90,7 +92,7 @@ STORE_TABLE='
 bun|d|install/cache/*@*|install/cache/@*
 bun|d|install/cache/@*/*@*|install/cache/@t@/*
 npm|f|_cacache|*
-pnpm|d|*|
+pnpm|d|.|
 gradle|d|caches/modules-2/files-2.1/*/*/*|
 gradle|d|caches/transforms-*/*|
 gradle|d|wrapper/dists/*|
@@ -224,7 +226,10 @@ collect_units() {
 # parents up to $2), or a single file.
 evict_unit() {
   local store="$1" stop="$2" path="$3" p
-  if [ -d "$path" ] && [ ! -L "$path" ]; then
+  if [ "${path##*/}" = . ]; then
+    find "${path%/.}" -mindepth 2 -delete 2>/dev/null
+    find "${path%/.}" -mindepth 1 -maxdepth 1 ! -type d -delete 2>/dev/null
+  elif [ -d "$path" ] && [ ! -L "$path" ]; then
     unit_pre_evict "$store" "$path"
     rm -rf "$path" 2>/dev/null
     unit_post_evict "$store" "$path"

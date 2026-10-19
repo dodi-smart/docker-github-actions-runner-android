@@ -15,6 +15,7 @@ done
 touch "$RUNNER_DATA_DIR/slots/1/busy"                  # job running
 touch -d '7 hours ago' "$RUNNER_DATA_DIR/slots/2/busy" # crashed job's leftover
 # slot 3: idle
+mkdir -p "$RUNNER_DATA_DIR/slots/c1" && touch "$RUNNER_DATA_DIR/slots/c1/.lock" # control slot, no cache/
 ( flock 8; sleep 60 ) 8>"$RUNNER_DATA_DIR/slots/4/.prune.lock" & # another pruner
 holder=$!
 sleep 1
@@ -28,6 +29,7 @@ kept "$(unit 1)/data.bin"
 gone "$(unit 2)"
 gone "$(unit 3)"
 kept "$(unit 4)/data.bin"
+[ ! -e "$RUNNER_DATA_DIR/slots/c1/cache" ] || fail "control slot got a cache dir"
 grep -q 'slot 1: job running' <<<"$out" || fail "no log line for the busy slot"
 grep -q 'slot 2: stale busy' <<<"$out" || fail "no log line for the stale busy marker"
 grep -q 'slot 4: another prune' <<<"$out" || fail "no log line for the locked slot"
