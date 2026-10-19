@@ -41,7 +41,8 @@ jobs:
           set -euo pipefail
           for t in tests/*.sh; do
             # image-smoke.sh needs a built image; it runs in the build job.
-            [ "$(basename "$t")" = image-smoke.sh ] && continue
+            # harness.sh and lib.sh are sourced by the tests, not tests.
+            case "$(basename "$t")" in image-smoke.sh | harness.sh | lib.sh) continue ;; esac
             bash "$t"
           done
 

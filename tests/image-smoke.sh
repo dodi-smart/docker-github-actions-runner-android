@@ -6,7 +6,9 @@
 # (runner-slim) must carry java/node/tools but no Android SDK.
 # The check snippets are single-quoted on purpose: they expand inside the image.
 # shellcheck disable=SC2016
-set -euo pipefail
+
+# shellcheck source=tests/harness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/harness.sh"
 
 image="${1:?usage: tests/image-smoke.sh <image> [jdk-major] [node-major] [std|ndk|slim]}"
 want_jdk="${2:-}"
@@ -17,13 +19,16 @@ case "$variant" in
   *) echo "unknown variant '$variant' (want std, ndk or slim)" >&2; exit 2 ;;
 esac
 
-fails=0
-fail() { echo "FAIL: $*"; fails=$((fails + 1)); }
 pass() { echo "ok:   $*"; }
 indent() { printf '      %s\n' "${1//$'\n'/$'\n      '}"; }
 
+# One container, kept idle, runs every check: a docker run per check cost
+# ~0.5 s of startup each.
+container="$(docker run -d --rm --entrypoint sleep "$image" infinity)"
+at_exit "docker rm -f $container >/dev/null 2>&1"
+
 # in_image <script>: run a bash snippet inside the image.
-in_image() { docker run --rm --entrypoint bash "$image" -c "$1"; }
+in_image() { docker exec "$container" bash -c "$1"; }
 
 # check <description> <script> [grep pattern for the output]
 check() {
@@ -71,8 +76,4 @@ for tool in xxd flock jq git rustup-init; do
   check "$tool is on PATH" "command -v $tool"
 done
 
-if [ "$fails" -gt 0 ]; then
-  echo "$fails smoke check(s) failed for $image"
-  exit 1
-fi
-echo "image smoke passed for $image"
+finish "image smoke for $image"

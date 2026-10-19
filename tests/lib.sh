@@ -1,17 +1,14 @@
 #!/bin/bash
-# Shared helpers for tests/pruner-*.sh. Sourced, not run. Needs GNU coreutils,
-# find, flock (Linux, or `docker run --rm -v "$PWD:/w" -w /w ubuntu:24.04 bash tests/<t>.sh`).
-set -euo pipefail
+# Fixtures for tests/pruner-*.sh: pruner.sh sourced against a throwaway
+# RUNNER_DATA_DIR, on top of tests/harness.sh. Sourced, not run. Needs GNU
+# coreutils, find, flock (Linux, or
+# `docker run --rm -v "$PWD:/w" -w /w ubuntu:24.04 bash tests/<t>.sh`).
 
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-
-fails=0
-fail() { echo "FAIL: $*"; fails=$((fails + 1)); }
+# shellcheck source=tests/harness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/harness.sh"
 
 # shellcheck source=pruner.sh
-source "$here/../pruner.sh"
+source "$root/pruner.sh"
 RUNNER_DATA_DIR="$work/data"
 ACTION_CACHE_DIR="$work/no-action-cache"
 CACHE_BUDGET_PCT=100 # the byte budget decides, whatever the test fs is
@@ -39,7 +36,7 @@ mkfile() {
   touch -a -d "$3 days ago" "$1"
 }
 
-# mkdirfile <dir> <bytes> <age in days>: a unit with one file of that age.
+# mkunit <dir> <bytes> <age in days>: a unit with one file of that age.
 mkunit() {
   mkfile "$1/data.bin" "$2" "$3"
 }
@@ -53,15 +50,4 @@ budget_without() {
   total=$(stores_bytes "$cache")
   for u in "$@"; do total=$((total - $(sz "$u"))); done
   echo $((total + 20000))
-}
-
-gone() { if [ -e "$1" ] || [ -L "$1" ]; then fail "$1 should be evicted"; fi; }
-kept() { [ -e "$1" ] || [ -L "$1" ] || fail "$1 should survive"; }
-
-finish() {
-  if [ "$fails" -gt 0 ]; then
-    echo "$fails check(s) failed"
-    exit 1
-  fi
-  echo "PASS: $1"
 }
