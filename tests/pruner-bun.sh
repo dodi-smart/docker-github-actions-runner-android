@@ -1,21 +1,17 @@
 #!/bin/bash
 # pruner.sh must evict whole bun packages, never single files: bun reuses a
-# cache folder as complete whenever it exists. Builds a fake /root/.bun volume
-# (packages holding 0-byte files with old atimes, a scoped package, the
-# <pkg>/<ver> symlinks, @t@ piles and bin/bun), runs prune_caches under a small
-# cap, then checks every surviving package is complete and every evicted one
-# is fully gone. Needs GNU find/stat/du (Linux, or `docker run ubuntu`):
+# cache folder as complete whenever it exists. Builds a fake /root/.bun store
+# in a slot (packages holding 0-byte files with old atimes, a scoped package,
+# the <pkg>/<ver> symlinks, @t@ piles and bin/bun), runs prune_caches under a
+# small budget, then checks every surviving package is complete and every
+# evicted one is fully gone. Needs GNU tools (Linux, or `docker run ubuntu`):
 #   bash tests/pruner-bun.sh
-set -euo pipefail
-
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+# shellcheck source=tests/lib.sh
+source "$here/lib.sh"
 
-fails=0
-fail() { echo "FAIL: $*"; fails=$((fails + 1)); }
-
-bun="$work/caches/1/bun"
+cache0="$(mkslot 1)"
+bun="$cache0/bun"
 cache="$bun/install/cache"
 mkdir -p "$bun/bin" "$cache/@t@"
 head -c 300000 /dev/zero >"$bun/bin/bun"
@@ -56,14 +52,11 @@ touch -d '2 days ago' "$cache/.tmp/stale"
 head -c 10 /dev/zero >"$cache/half@1.0.0@@@1.tgz.part"
 touch -d '2 days ago' "$cache/half@1.0.0@@@1.tgz.part"
 
-# Cap = volume minus the three oldest packages (old-a, old-b, @scope/old-c),
-# plus half a package of slack: exactly those three must go, nothing else.
-sz() { du -sb "$1" | awk '{print $1}'; }
-cap=$(($(sz "$bun") - $(sz "$cache/old-a@1.0.0@@@1") - $(sz "$cache/old-b@2.0.0@@@1") \
-  - $(sz "$cache/@scope/old-c@3.0.0@@@1") - 2 * 4096 + 50000))
-# shellcheck source=pruner.sh
-source "$here/../pruner.sh"
-CACHES_ROOT="$work/caches" CACHE_CAP_BYTES="$cap" prune_caches
+# Budget = volume minus the three oldest packages (old-a, old-b, @scope/old-c):
+# exactly those three must go, nothing else.
+CACHE_BUDGET_BYTES=$(budget_without "$cache0" "$cache/old-a@1.0.0@@@1" "$cache/old-b@2.0.0@@@1" \
+  "$cache/@scope/old-c@3.0.0@@@1")
+prune_caches >/dev/null
 
 for entry in 'old-a@1.0.0@@@1' 'old-b@2.0.0@@@1' '@scope/old-c@3.0.0@@@1'; do
   base="${entry##*/}"
@@ -93,11 +86,7 @@ done
 [ -e "$cache/.tmp/live" ] || fail "live .tmp entry removed"
 [ ! -e "$cache/half@1.0.0@@@1.tgz.part" ] || fail "stale .part kept"
 
-size=$(sz "$bun")
-[ "$size" -le "$cap" ] || fail "volume ${size}B still over the ${cap}B cap"
+size=$(stores_bytes "$cache0")
+[ "$size" -le "$CACHE_BUDGET_BYTES" ] || fail "slot ${size}B still over the ${CACHE_BUDGET_BYTES}B budget"
 
-if [ "$fails" -gt 0 ]; then
-  echo "$fails check(s) failed"
-  exit 1
-fi
-echo "PASS: bun cache evicted by whole package (volume ${size}B)"
+finish "bun cache evicted by whole package (slot ${size}B)"
