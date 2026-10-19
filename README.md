@@ -125,7 +125,12 @@ The `pruner` service ([`pruner.sh`](pruner.sh)) keeps slow work off the job
 path:
 
 - **Nightly:** trims the Gradle, bun, mise and hk caches to `CACHE_CAP_BYTES`
-  each (default 20 GiB), dropping the least recently used files first. It then
+  each (default 20 GiB), least recently used first. The bun cache drops whole
+  package folders (`install/cache/<pkg>@<ver>@@@1`, by the atime of their
+  `package.json`) and never `bin/`: bun reuses a package folder as complete
+  whenever it exists, so a single evicted file would go missing from every
+  later install. mise tool versions are dropped whole too; the Gradle, mise
+  download and hk caches drop single files. It then
   runs `docker system prune --filter until=24h` and
   `docker builder prune --filter until=72h`. Named volumes are never pruned.
 - **Hourly:** fills the action archive cache, capped at 2 GiB.

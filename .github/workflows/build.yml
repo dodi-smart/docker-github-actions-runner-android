@@ -10,6 +10,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  scripts:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: shellcheck
+        run: shellcheck -x pruner.sh tests/*.sh
+
+      - name: tests
+        run: |
+          set -euo pipefail
+          for t in tests/*.sh; do bash "$t"; done
+
   matrix:
     name: Generate build matrix
     runs-on: ubuntu-latest
@@ -83,14 +97,14 @@ jobs:
 
   gate:
     name: All builds passed
-    needs: [matrix, build]
+    needs: [scripts, matrix, build]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check that all required jobs succeeded
         run: |
-          if [ "${{ needs.matrix.result }}" != "success" ] || [ "${{ needs.build.result }}" != "success" ]; then
-            echo "::error::A required job failed or was cancelled (matrix: ${{ needs.matrix.result }}, build: ${{ needs.build.result }})"
+          if [ "${{ needs.scripts.result }}" != "success" ] || [ "${{ needs.matrix.result }}" != "success" ] || [ "${{ needs.build.result }}" != "success" ]; then
+            echo "::error::A required job failed or was cancelled (scripts: ${{ needs.scripts.result }}, matrix: ${{ needs.matrix.result }}, build: ${{ needs.build.result }})"
             exit 1
           fi
           echo "All builds succeeded"
