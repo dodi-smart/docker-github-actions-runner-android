@@ -11,8 +11,10 @@
 #    cache trees: the slot caches are the warm cache. Without a slot (the image
 #    run outside compose) there is no marker, so it always sweeps.
 #
-# Intentionally not using set -e: individual prune failures should not
-# prevent the job from starting.
+# The runner runs this hook under `bash -e`, whatever the shebang says, and a
+# non-zero exit fails the job before its first step. So every sweep command
+# ends in `|| true` and the script ends in `exit 0`: a failed prune must never
+# stop the job from starting.
 #
 # NOTE: this is only half the fix. Workflows that restore ~/.bun/install/cache
 # via actions/cache with restore-keys can re-import a poisoned entry from the
@@ -42,13 +44,20 @@ echo "[pre-job] Previous job did not finish; sweeping incomplete cache entries..
 # for ..." and it looks like a dependency problem rather than a runner
 # problem. Only those two levels: the cache holds hundreds of thousands of
 # files, and a file inside a package that happens to end in .tmp is content.
+# nullglob: with no @scope folder the pattern would reach find as a literal
+# path, and find exits 1 on it.
 bun_cache="$HOME/.bun/install/cache"
-find "$bun_cache" "$bun_cache"/@*/ -mindepth 1 -maxdepth 1 \( -name '*.tmp' -o -name '*.part' \) \
-  -exec rm -rf {} + 2>/dev/null
+if [ -d "$bun_cache" ]; then
+  shopt -s nullglob
+  find "$bun_cache" "$bun_cache"/@*/ -mindepth 1 -maxdepth 1 \( -name '*.tmp' -o -name '*.part' \) \
+    -exec rm -rf {} + 2>/dev/null || true
+  shopt -u nullglob
+fi
 
 # Gradle: leftover lock / journal / daemon state from a killed compile.
 # Keep modules-2, build-cache-*, and transforms-*.
-rm -f "$HOME"/.gradle/caches/modules-2/modules-2.lock 2>/dev/null
-rm -rf "$HOME"/.gradle/caches/journal-* "$HOME"/.gradle/daemon/ 2>/dev/null
+rm -f "$HOME"/.gradle/caches/modules-2/modules-2.lock 2>/dev/null || true
+rm -rf "$HOME"/.gradle/caches/journal-* "$HOME"/.gradle/daemon/ 2>/dev/null || true
 
 echo "[pre-job] Sweep complete."
+exit 0
