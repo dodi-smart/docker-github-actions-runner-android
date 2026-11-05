@@ -334,7 +334,7 @@ comments.
 | `RUNNER_IMAGE` | `ghcr.io/dodi-smart/github-runner` | image or tag (e.g. `:slim`) |
 | `RUNNER_NAME_PREFIX`, `RUNNER_GROUP` | `runner`, `Default` | runner name and group |
 | `CACHE_BUDGET_BYTES`, `CACHE_BUDGET_PCT` | 60 GiB, `40` | pruner cache budget per host |
-| `PRUNE_FREE_PCT`, `PRUNE_INTERVAL_SECONDS` | `15`, `86400` | when the pruner runs |
+| `PRUNE_FREE_PCT`, `PRUNE_INTERVAL_SECONDS` | `5`, `86400` | when the pruner runs |
 | `DOCKER_PRUNE_KEEP_LABELS` | empty | space-separated `key` or `key=value`: images and stopped containers the pruner keeps, plus the image of a kept container |
 | `DOCKER_PRUNE_KEEP_IMAGES` | empty | space-separated name patterns, e.g. `variscite:* ghcr.io/acme/*`, for images you cannot label |
 | `PREFETCH_SOURCES`, `PREFETCH_EXTRA` | — | action archive cache sources |

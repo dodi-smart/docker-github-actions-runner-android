@@ -35,7 +35,7 @@
 #                            RUNNER_DATA_DIR (40); the smaller wins and is split
 #                            evenly between the slots
 #   PRUNE_CHECK_SECONDS      df check period                       (3600)
-#   PRUNE_FREE_PCT           full pass when free space is below    (15)
+#   PRUNE_FREE_PCT           full pass when free space is below    (5)
 #   PRUNE_INTERVAL_SECONDS   full pass at least this often         (86400)
 #   PRUNE_INITIAL_DELAY      sleep before the first check (300; keeps a
 #                            `docker compose up -d` from running a scan at once)
@@ -58,7 +58,7 @@ RUNNER_DATA_DIR="${RUNNER_DATA_DIR:-/var/lib/github-runner}"
 CACHE_BUDGET_BYTES="${CACHE_BUDGET_BYTES:-64424509440}" # 60 GiB
 CACHE_BUDGET_PCT="${CACHE_BUDGET_PCT:-40}"
 PRUNE_CHECK_SECONDS="${PRUNE_CHECK_SECONDS:-3600}"
-PRUNE_FREE_PCT="${PRUNE_FREE_PCT:-15}"
+PRUNE_FREE_PCT="${PRUNE_FREE_PCT:-5}"
 PRUNE_INTERVAL_SECONDS="${PRUNE_INTERVAL_SECONDS:-86400}"
 BUSY_STALE_MINUTES=360 # a `busy` marker older than 6 h is a crashed job's leftover
 ACTION_CACHE_DIR=/opt/actionarchivecache # mount point in docker-compose.yml
