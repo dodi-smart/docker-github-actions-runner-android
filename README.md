@@ -272,6 +272,15 @@ path:
 - **Adaptive.** It runs daily, and early when free disk drops below
   `PRUNE_FREE_PCT`. Then `docker system prune` / `docker builder prune` clean
   old images and build cache, more aggressively when disk is tight.
+- **Other workloads stay.** On a host that also runs other Docker work, list
+  what to keep in `DOCKER_PRUNE_KEEP_LABELS` and `DOCKER_PRUNE_KEEP_IMAGES`.
+  Each full pass logs every kept image with its size, so you can see why disk
+  space did not come back. Both need Docker 25 or later on the host; on an
+  older one the pass logs that and skips the docker prune. Docker's age limit
+  never counts from last use, so an idle image without protection can go soon
+  after its container stops. Networks and build cache are not protected: a kept
+  stopped container on a custom network needs `docker compose up`, not
+  `docker start`.
 - **Hourly:** it fills the action archive cache.
 
 After each job, [`cleanup.sh`](cleanup.sh) does a quick tidy-up only: `/tmp`,
@@ -326,7 +335,9 @@ comments.
 | `RUNNER_IMAGE` | `ghcr.io/dodi-smart/github-runner` | image or tag (e.g. `:slim`) |
 | `RUNNER_NAME_PREFIX`, `RUNNER_GROUP` | `runner`, `Default` | runner name and group |
 | `CACHE_BUDGET_BYTES`, `CACHE_BUDGET_PCT` | 60 GiB, `40` | pruner cache budget per host |
-| `PRUNE_FREE_PCT`, `PRUNE_INTERVAL_SECONDS` | `15`, `86400` | when the pruner runs |
+| `PRUNE_FREE_PCT`, `PRUNE_INTERVAL_SECONDS` | `5`, `86400` | when the pruner runs |
+| `DOCKER_PRUNE_KEEP_LABELS` | empty | space-separated `key` or `key=value`: images and stopped containers the pruner keeps, plus the image of a kept container |
+| `DOCKER_PRUNE_KEEP_IMAGES` | empty | space-separated name patterns, e.g. `variscite:* ghcr.io/acme/*`, for images you cannot label |
 | `PREFETCH_SOURCES`, `PREFETCH_EXTRA` | — | action archive cache sources |
 | `DISABLE_AUTO_UPDATE` | empty | any non-empty value (even `false`) disables runner self-update |
 

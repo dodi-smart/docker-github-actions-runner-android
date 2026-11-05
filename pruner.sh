@@ -35,7 +35,7 @@
 #                            RUNNER_DATA_DIR (40); the smaller wins and is split
 #                            evenly between the slots
 #   PRUNE_CHECK_SECONDS      df check period                       (3600)
-#   PRUNE_FREE_PCT           full pass when free space is below    (15)
+#   PRUNE_FREE_PCT           full pass when free space is below    (5)
 #   PRUNE_INTERVAL_SECONDS   full pass at least this often         (86400)
 #   PRUNE_INITIAL_DELAY      sleep before the first check (300; keeps a
 #                            `docker compose up -d` from running a scan at once)
@@ -45,6 +45,13 @@
 #   PREFETCH_INTERVAL_SECONDS  prefetch period (default 3600; 0 = off)
 #   DOCKER_PRUNE_UNTIL / DOCKER_PRUNE_UNTIL_LOW / DOCKER_BUILDER_PRUNE_UNTIL
 #                            (24h / 2h when below PRUNE_FREE_PCT / 72h)
+#   DOCKER_PRUNE_KEEP_LABELS space-separated key or key=value entries: images and
+#                            stopped containers carrying any of them stay, and so
+#                            does the image of such a container (empty)
+#   DOCKER_PRUNE_KEEP_IMAGES space-separated patterns on the names `docker image
+#                            ls` prints, * crossing /: "variscite:* ghcr.io/acme/*".
+#                            A bare repository covers all of its tags (empty)
+#                            Either setting needs Docker 25+ on the host.
 #
 # Intentionally not using set -e: one failing step must not stop the others.
 
@@ -52,7 +59,7 @@ RUNNER_DATA_DIR="${RUNNER_DATA_DIR:-/var/lib/github-runner}"
 CACHE_BUDGET_BYTES="${CACHE_BUDGET_BYTES:-64424509440}" # 60 GiB
 CACHE_BUDGET_PCT="${CACHE_BUDGET_PCT:-40}"
 PRUNE_CHECK_SECONDS="${PRUNE_CHECK_SECONDS:-3600}"
-PRUNE_FREE_PCT="${PRUNE_FREE_PCT:-15}"
+PRUNE_FREE_PCT="${PRUNE_FREE_PCT:-5}"
 PRUNE_INTERVAL_SECONDS="${PRUNE_INTERVAL_SECONDS:-86400}"
 BUSY_STALE_MINUTES=360 # a `busy` marker older than 6 h is a crashed job's leftover
 ACTION_CACHE_DIR=/opt/actionarchivecache # mount point in docker-compose.yml
@@ -63,6 +70,8 @@ GITHUB_API="https://api.github.com"
 DOCKER_PRUNE_UNTIL="${DOCKER_PRUNE_UNTIL:-24h}"
 DOCKER_PRUNE_UNTIL_LOW="${DOCKER_PRUNE_UNTIL_LOW:-2h}"
 DOCKER_BUILDER_PRUNE_UNTIL="${DOCKER_BUILDER_PRUNE_UNTIL:-72h}"
+DOCKER_PRUNE_KEEP_LABELS="${DOCKER_PRUNE_KEEP_LABELS:-}"
+DOCKER_PRUNE_KEEP_IMAGES="${DOCKER_PRUNE_KEEP_IMAGES:-}"
 
 log() { echo "[pruner] $(date -u +%FT%TZ) $*"; }
 
@@ -484,6 +493,130 @@ prefetch_actions() {
   GH_TOKEN=""
 }
 
+# Epoch of docker's `until` value $1: a duration back from now (24h, 90m, 1h30m)
+# or a point in time. Prints nothing when it is neither.
+until_epoch() {
+  local rest="$1" secs=0 unit
+  while [[ $rest =~ ^([0-9]+)([hms])(.*)$ ]]; do
+    case "${BASH_REMATCH[2]}" in
+      h) unit=3600 ;;
+      m) unit=60 ;;
+      s) unit=1 ;;
+    esac
+    secs=$((secs + BASH_REMATCH[1] * unit))
+    rest="${BASH_REMATCH[3]}"
+  done
+  if [ -z "$rest" ]; then
+    echo $(($(date +%s) - secs))
+  elif [[ $1 == [0-9][0-9][0-9][0-9]-* ]]; then # date alone would take "2d" for a time
+    date -d "$1" +%s 2>/dev/null
+  fi
+}
+
+# Run docker with arguments $@, its command and its output in the log.
+docker_logged() {
+  log "docker $*"
+  docker "$@" 2>&1 | sed 's/^/[pruner] /'
+}
+
+# What `docker system prune -af --filter until=$1` does, minus the images and
+# stopped containers DOCKER_PRUNE_KEEP_* protect. The prune itself cannot do it:
+# it has no reference filter, and given several label!= filters it spares only
+# what carries all of them (containers on every image store, images on overlay2;
+# only the containerd store spares what carries any). So docker is asked about
+# one label at a time and this function removes what is left, without -f: an
+# image a job has just started on stays.
+#
+# Image age comes from the daemon's own `until` list (Docker 25+), as the stores
+# differ: overlay2 counts from the build, containerd from arrival on this host.
+#
+# Everything is listed before anything is removed, and any failed listing ends
+# the pass: a missing list of what to keep must never read as nothing to keep.
+prune_docker_keeping() {
+  local until="$1" cutoff out containers images label id status name created image repo tag size pat ref
+  local removed_containers=0 removed_refs=0
+  local -a labels patterns
+  local -A kept_containers=() kept_images=() in_use=() old_images=() sizes=() refs=()
+  read -ra labels <<<"$DOCKER_PRUNE_KEEP_LABELS"
+  read -ra patterns <<<"$DOCKER_PRUNE_KEEP_IMAGES" # read: a pattern never globs the cwd
+  cutoff=$(until_epoch "$until")
+  if [ -z "$cutoff" ]; then
+    log "cannot read until=${until}; skipping docker prune"
+    return 0
+  fi
+  log "docker prune until=${until}, keeping labels [${labels[*]}] images [${patterns[*]}]"
+
+  for label in "${labels[@]}"; do
+    if ! containers=$(docker ps -aq --no-trunc --filter "label=$label") ||
+       ! images=$(docker image ls -q --no-trunc --filter "label=$label"); then
+      log "cannot list what label $label keeps; skipping docker prune"
+      return 0
+    fi
+    for id in $containers; do kept_containers[$id]="$label"; done
+    for id in $images; do kept_images[$id]="label $label"; done
+  done
+  out=$(docker image ls --no-trunc --format '{{.ID}} {{.Repository}} {{.Tag}} {{.Size}}') ||
+    { log "cannot list images; skipping docker prune"; return 0; }
+  while read -r id repo tag size; do
+    [ -n "$id" ] || continue
+    sizes[$id]="$size"
+    [ "$repo" != '<none>' ] || continue
+    [ "$tag" = '<none>' ] || refs[$id]+=" $repo:$tag"
+    for pat in "${patterns[@]}"; do
+      # shellcheck disable=SC2053  # the right side is a pattern on purpose
+      if [[ $repo:$tag == $pat || $repo == $pat ]]; then kept_images[$id]="pattern $pat"; fi
+    done
+  done <<<"$out"
+  out=$(docker image ls -q --no-trunc --filter "until=$until") ||
+    { log "cannot list images by age (keep settings need Docker 25+); skipping docker prune"; return 0; }
+  for id in $out; do old_images[$id]=1; done
+
+  out=$(docker ps -aq --no-trunc) || { log "cannot list containers; skipping docker prune"; return 0; }
+  if [ -n "$out" ]; then
+    # A container gone by now fails the call but not the lines of the others.
+    # shellcheck disable=SC2086  # one word per container id
+    out=$(docker inspect --format '{{.Id}} {{.State.Status}} {{.Image}} {{.Created}} {{.Name}}' $out 2>/dev/null) || true
+    [ -n "$out" ] || { log "cannot inspect containers; skipping docker prune"; return 0; }
+  fi
+  while read -r id status image created name; do
+    [ -n "$id" ] || continue
+    case "$status" in
+      created | exited | dead)
+        if [ -n "${kept_containers[$id]:-}" ]; then
+          log "kept container ${name#/} (label ${kept_containers[$id]})"
+          kept_images[$image]="container ${name#/}"
+        elif [ "$(date -d "$created" +%s)" -lt "$cutoff" ] && docker rm "$id" >/dev/null 2>&1; then
+          removed_containers=$((removed_containers + 1))
+          continue # its image is free, unless another container says otherwise
+        fi
+        ;;
+    esac
+    in_use[$image]=1
+  done <<<"$out"
+
+  docker_logged network prune -f --filter "until=${until}"
+
+  for id in "${!sizes[@]}"; do
+    ref="${refs[$id]:-$id}"
+    if [ -n "${kept_images[$id]:-}" ]; then
+      log "kept image ${ref# } ${sizes[$id]} (${kept_images[$id]})"
+    elif [ -z "${in_use[$id]:-}" ] && [ -n "${old_images[$id]:-}" ]; then
+      # Every tag by name: an id with several tags is refused without -f.
+      for ref in $ref; do
+        if out=$(docker image rm "$ref" 2>&1); then
+          removed_refs=$((removed_refs + 1))
+          log "removed image $ref"
+        else
+          log "left image $ref: $out"
+        fi
+      done
+    fi
+  done
+  log "removed ${removed_containers} containers and ${removed_refs} image references"
+
+  docker_logged builder prune -af --filter "until=${until}"
+}
+
 # $1 = low: free space is below PRUNE_FREE_PCT, so prune docker harder.
 prune_docker() {
   local until="$DOCKER_PRUNE_UNTIL"
@@ -492,10 +625,12 @@ prune_docker() {
     log "docker daemon unreachable; skipping docker prune"
     return 0
   fi
-  log "docker system prune -af --filter until=${until}"
-  docker system prune -af --filter "until=${until}" 2>&1 | sed 's/^/[pruner] /'
-  log "docker builder prune -af --filter until=${DOCKER_BUILDER_PRUNE_UNTIL}"
-  docker builder prune -af --filter "until=${DOCKER_BUILDER_PRUNE_UNTIL}" 2>&1 | sed 's/^/[pruner] /'
+  if [ -n "${DOCKER_PRUNE_KEEP_LABELS// /}${DOCKER_PRUNE_KEEP_IMAGES// /}" ]; then
+    prune_docker_keeping "$until"
+  else
+    docker_logged system prune -af --filter "until=${until}"
+  fi
+  docker_logged builder prune -af --filter "until=${DOCKER_BUILDER_PRUNE_UNTIL}"
 }
 
 run_once() {
