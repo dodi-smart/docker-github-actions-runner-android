@@ -275,9 +275,10 @@ path:
 - **Other workloads stay.** On a host that also runs other Docker work, list
   what to keep in `DOCKER_PRUNE_KEEP_LABELS` and `DOCKER_PRUNE_KEEP_IMAGES`.
   Each full pass logs every kept image with its size, so you can see why disk
-  space did not come back. Docker's age limit counts from when an image was
-  built, not last used, so an idle image without protection goes soon after
-  its container stops. Networks and build cache are not protected: a kept
+  space did not come back. Both need Docker 25 or later on the host; on an
+  older one the pass logs that and skips the docker prune. Docker's age limit
+  never counts from last use, so an idle image without protection can go soon
+  after its container stops. Networks and build cache are not protected: a kept
   stopped container on a custom network needs `docker compose up`, not
   `docker start`.
 - **Hourly:** it fills the action archive cache.

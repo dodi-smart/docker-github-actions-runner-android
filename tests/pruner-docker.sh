@@ -23,7 +23,6 @@ age=$((now - $(until_epoch 1h30m)))
 [ "$age" -ge 5400 ] && [ "$age" -le 5405 ] || fail "1h30m read as ${age}s"
 [ "$(until_epoch 2026-11-03T21:00:00Z)" = "$(date -d 2026-11-03T21:00:00Z +%s)" ] || fail "a timestamp misread"
 [ -z "$(until_epoch 2d)" ] || fail "2d is no docker duration and must not read as a time"
-if created_before "" "$now"; then fail "an image without a creation time counted as old"; fi
 
 if ! outer info >/dev/null 2>&1; then
   echo "SKIP: no docker daemon to start docker:dind on"
@@ -39,7 +38,7 @@ start_daemon() {
   outer run -d --rm --privileged --name "$name" --hostname "$name" -p 127.0.0.1::2375 \
     -e DOCKER_TLS_CERTDIR= "$dind_image" --host=tcp://0.0.0.0:2375 --tls=false "$@" >/dev/null
   port=$(outer port "$name" 2375/tcp)
-  export DOCKER_HOST="tcp://${port##*[ ]}"
+  export DOCKER_HOST="tcp://$port"
   for i in $(seq 1 60); do
     docker info >/dev/null 2>&1 && break
     [ "$i" -lt 60 ] || { echo "daemon $name did not start"; exit 1; }
@@ -53,6 +52,7 @@ start_daemon() {
 
 # mkimage <tag> [<label>...]: a small image, unique through its name label. It
 # needs a layer: an image without one has no creation time, so no age to prune by.
+# build_epoch=<seconds> sets the build time.
 mkdir "$work/context"
 touch "$work/context/file"
 mkimage() {
@@ -63,17 +63,11 @@ mkimage() {
     echo 'COPY file /file'
     echo "LABEL fixture=\"$tag\""
     for label in "$@"; do echo "LABEL $label"; done
-  } | docker build -q -t "$tag" -f - "$work/context" >/dev/null
+  } | docker build -q ${build_epoch:+--build-arg "SOURCE_DATE_EPOCH=$build_epoch"} -t "$tag" -f - "$work/context" >/dev/null
 }
 
 fixtures() {
-  local ids
-  ids=$(docker ps -aq)
-  # shellcheck disable=SC2086  # one word per id
-  [ -z "$ids" ] || docker rm -f $ids >/dev/null
-  ids=$(docker image ls -q | sort -u)
-  # shellcheck disable=SC2086  # one word per id
-  [ -z "$ids" ] || docker image rm -f $ids >/dev/null 2>&1 || true
+  docker system prune -af >/dev/null
   mkimage by-label-a:1 keep.a=1
   mkimage by-label-b:1 keep.b=yes
   mkimage wrong-value:1 keep.b=no
@@ -106,20 +100,26 @@ check_store() {
   # Everything is too young for the age limit: the keep path must not remove it.
   pass=young
   fixtures
+  # Built long ago, arrived just now, like a pull: save and load sets that apart.
+  build_epoch=1000000000 mkimage built-long-ago:1
+  docker save built-long-ago:1 -o "$work/image.tar"
+  docker image rm built-long-ago:1 >/dev/null
+  docker load -q -i "$work/image.tar" >/dev/null
   DOCKER_PRUNE_UNTIL=1h
   out=$(prune_docker)
   image_kept junk:1
   image_kept held-by-unkept:1
   has_container unkept || fail "$backend/$pass: young stopped container removed"
+  # Image age is the daemon's: from the build on overlay2, from arrival on containerd.
+  if [ "$backend" = overlay2 ]; then image_gone built-long-ago:1; else image_kept built-long-ago:1; fi
 
   DOCKER_PRUNE_UNTIL=0s
   DOCKER_PRUNE_UNTIL_LOW=0s
   for pass in normal low; do
     fixtures
     if [ "$pass" = low ]; then
-      DOCKER_PRUNE_UNTIL=1h # only the low-space age may let this pass remove anything
-      out=$(prune_docker low)
-      DOCKER_PRUNE_UNTIL=0s
+      # Only the low-space age may let this pass remove anything.
+      out=$(DOCKER_PRUNE_UNTIL=1h prune_docker low)
     else
       out=$(prune_docker)
     fi
@@ -148,14 +148,10 @@ check_store() {
   # A failing listing must never read as "nothing is protected".
   pass=listing-fails
   fixtures
-  mkdir -p "$work/shim"
-  cat >"$work/shim/docker" <<EOF
-#!/bin/bash
-case "\$*" in 'image ls -q --no-trunc --filter label='*) exit 1 ;; esac
-exec $(command -v docker) "\$@"
-EOF
-  chmod +x "$work/shim/docker"
-  out=$(PATH="$work/shim:$PATH" prune_docker)
+  out=$(
+    docker() { case "$*" in 'image ls -q --no-trunc --filter label='*) return 1 ;; esac; command docker "$@"; }
+    prune_docker
+  )
   image_kept by-label-a:1
   image_kept junk:1
   grep -q 'skipping docker prune' <<<"$out" || fail "$backend/$pass: no log line for the skipped prune"
