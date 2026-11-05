@@ -72,7 +72,7 @@ fi
 if [ "$variant" = ndk ]; then
   check "NDK is installed" 'ls -d "$ANDROID_SDK_ROOT"/ndk/*/ >/dev/null'
 fi
-for tool in xxd flock jq git rustup-init; do
+for tool in xxd flock jq git ninja rustup-init; do
   check "$tool is on PATH" "command -v $tool"
 done
 

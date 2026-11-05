@@ -93,12 +93,12 @@ FROM myoung34/github-runner:$VERSION AS core
 # Packages that do not depend on JAVA_VERSION/NODE_VERSION, so this layer is
 # shared by every tag too.
 #   - iproute2: ip tools
-#   - cmake, build-essential, swig: native builds
+#   - cmake, ninja-build, build-essential, swig: native builds
 #   - xxd: not in the base image
 #   - pigz: parallel gzip, used by tar/docker when available
 RUN apt-get -qq update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    iproute2 cmake build-essential swig xxd pigz \
+    iproute2 cmake ninja-build build-essential swig xxd pigz \
   && rm -rf /var/lib/apt/lists/*
 
 # rustup-init only, no toolchain: ~/.cargo and ~/.rustup are links into the
