@@ -23,13 +23,14 @@ home="$work/home"
 mkdir -p "$data" "$home"
 
 # Run setup_slot in a child that holds its slot for $2 seconds and reports
-# "<id> <labels> <workdir>" to file $1.
+# "<id> <labels> <workdir>" to file $1. $3 is the container's home: runners have
+# one each, so claims that run at the same time must not share one.
 claim() {
-  local out="$1" hold="$2"
+  local out="$1" hold="$2" container_home="${3:-$home}"
   (
     # shellcheck source=SCRIPTDIR/../preflight-entrypoint.sh
     source "$root/preflight-entrypoint.sh"
-    CACHE_LINKS=("bun:$home/.bun" "pnpm/store:$home/.local/share/pnpm" "toolcache:$home/toolcache")
+    CACHE_LINKS=("bun:$container_home/.bun" "pnpm/store:$container_home/.local/share/pnpm" "toolcache:$container_home/toolcache")
     RUNNER_DATA_DIR="$data" setup_slot >/dev/null
     echo "$RUNNER_SLOT $LABELS $RUNNER_WORKDIR" >"$out"
     sleep "$hold"
@@ -38,7 +39,7 @@ claim() {
 
 # --- concurrent claims -------------------------------------------------------
 export LABELS=docker,light RUNNER_2_LABELS=docker,light,large
-for i in 1 2 3 4; do claim "$work/claim.$i" 3 & done
+for i in 1 2 3 4; do claim "$work/claim.$i" 3 "$work/home.$i" & done
 sleep 1
 ids=$(cut -d' ' -f1 "$work"/claim.* | sort -n | tr '\n' ' ')
 [ "$ids" = "1 2 3 4 " ] || fail "concurrent claims got '$ids', want '1 2 3 4 '"
