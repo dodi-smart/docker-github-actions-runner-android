@@ -32,7 +32,9 @@ and adds:
   at the same path on the host and in the runner;
 - **a pruner** that keeps every cache within a disk budget sized to the
   machine, without touching a cache while a job is using it;
-- **a local action archive cache** that avoids GitHub's download rate limits.
+- **a local action archive cache** that avoids GitHub's download rate limits;
+- **a host-wide Maven proxy**, so a host downloads each Maven Central, Google
+  Maven and Gradle Plugin Portal artifact once, not once per runner.
 
 ## Contents
 
@@ -44,6 +46,7 @@ and adds:
 - [Caches](#caches)
 - [Maintenance](#maintenance)
 - [Action archive cache](#action-archive-cache)
+- [Maven proxy](#maven-proxy)
 - [Configuration reference](#configuration-reference)
 - [Troubleshooting](#troubleshooting)
 - [Upgrading from named volumes](#upgrading-from-named-volumes)
@@ -317,6 +320,74 @@ docker compose run --rm pruner prefetch
 To confirm it works, re-run a job with debug logging. "Set up job" then shows
 `Copied action archive '/opt/actionarchivecache/...'`.
 
+## Maven proxy
+
+Every runner slot keeps its own Gradle cache, and the pruner evicts from those
+caches. Without a shared layer, a host downloads the same jars again for each
+slot and after each eviction. Maven Central limits downloads of large files
+per IP and per file, so Robolectric's 150–190 MB jars got a host blocked for
+about a day
+([#45](https://github.com/dodi-smart/docker-github-actions-runner-android/issues/45)).
+
+The `maven-proxy` service is an nginx caching proxy
+([`maven-proxy/default.conf.template`](maven-proxy/default.conf.template)) that
+every slot on the host resolves through:
+
+- **One download per host.** A cached artifact is served locally, whichever
+  slot asks for it. When several slots miss the same file at once, they wait
+  for a single upstream download (`proxy_cache_lock`).
+- **Gradle uses it without workflow changes.** The preflight installs
+  [`maven-proxy.gradle`](maven-proxy/maven-proxy.gradle) into each slot's
+  `~/.gradle/init.d`. The script redirects every repository whose URL is
+  Maven Central (`mavenCentral()`), Google Maven (`google()`) or the Plugin
+  Portal (`gradlePluginPortal()`, and the implicit portal for project plugins)
+  to the proxy. Other repositories stay as declared. Test tasks also get
+  `robolectric.dependency.repo.url`, so the `android-all` jars that Robolectric
+  downloads at test time come through the proxy too.
+- **It falls back to upstream.** The script probes the proxy at the start of
+  each build. If the proxy does not answer, the build uses the upstream
+  repositories as declared and logs
+  `maven-proxy: … does not answer; using the upstream repositories`.
+- **It is bounded.** The cache lives in `RUNNER_DATA_DIR/maven-proxy`, outside
+  the slots and the pruner's budget. nginx evicts the least recently used
+  entries above `MAVEN_PROXY_MAX_SIZE` (default 20 GB), and anything unused
+  for 90 days. A 404 is cached for 10 minutes and `maven-metadata.xml` for 10
+  minutes. Errors such as `429` are never cached.
+- **It is private to the host.** Only the Compose network reaches it; no port
+  is published.
+
+To turn it off:
+
+- **On a host:** set `MAVEN_PROXY=off` in `.env` and run
+  `docker compose up -d`. The runners remove the init script, and the proxy
+  container can be stopped with
+  `docker compose up -d --scale maven-proxy=0`.
+- **For one job:** set `MAVEN_PROXY: off` in the job's `env`.
+
+To check that it works, look for `cache=HIT` in its log, or ask it from a
+runner:
+
+```bash
+docker compose logs maven-proxy | tail
+docker compose exec runner curl -sI http://maven-proxy:8080/maven2/junit/junit/4.13.2/junit-4.13.2.pom | grep -i x-cache-status
+```
+
+To empty the cache, run `docker compose down maven-proxy`, delete
+`RUNNER_DATA_DIR/maven-proxy` (it belongs to nginx, so use `sudo`), then run
+`docker compose up -d`.
+
+**Why a proxy and not `GRADLE_RO_DEP_CACHE`.** Gradle can read a shared
+read-only dependency cache, which the pruner could seed from the slots. That
+cache only helps once a seed pass has run, so every slot still downloads a
+new artifact itself until then, and concurrent first downloads are not
+coalesced. It must match the cache layout of each Gradle version the
+projects use. It cannot change while builds read it, so seeding means copying
+and swapping a tree of many gigabytes. It also never covers the jars that
+Robolectric fetches itself. An HTTP proxy has none of these limits. It is
+independent of the Gradle version, serves any Maven client, and fails open.
+nginx was chosen over Reposilite because it has no JVM, no state beyond its
+cache and no admin account, and it coalesces concurrent misses.
+
 ## Configuration reference
 
 Set these in `.env`. [`.env.example`](.env.example) has them all, with
@@ -339,6 +410,10 @@ comments.
 | `DOCKER_PRUNE_KEEP_LABELS` | empty | space-separated `key` or `key=value`: images and stopped containers the pruner keeps, plus the image of a kept container |
 | `DOCKER_PRUNE_KEEP_IMAGES` | empty | space-separated name patterns, e.g. `variscite:* ghcr.io/acme/*`, for images you cannot label |
 | `PREFETCH_SOURCES`, `PREFETCH_EXTRA` | — | action archive cache sources |
+| `MAVEN_PROXY` | `on` | `off` makes Gradle resolve upstream directly (see [Maven proxy](#maven-proxy)) |
+| `MAVEN_PROXY_URL` | `http://maven-proxy:8080` | the proxy the init script uses |
+| `MAVEN_PROXY_MAX_SIZE` | `20g` | size limit of the proxy's cache |
+| `MAVEN_CENTRAL_URL`, `GOOGLE_MAVEN_URL`, `GRADLE_PLUGIN_PORTAL_URL` | the public repositories | what the proxy fetches from, e.g. a closer mirror |
 | `DISABLE_AUTO_UPDATE` | empty | any non-empty value (even `false`) disables runner self-update |
 
 `EPHEMERAL` and `DISABLE_AUTO_UPDATE` count as set for any non-empty value,
@@ -358,6 +433,11 @@ because the upstream entrypoint only checks whether they are empty.
 - **A job fails with a corrupt cache.** Stop that slot's runner, delete the
   store (`rm -rf $RUNNER_DATA_DIR/slots/<n>/cache/<store>`) and start it
   again. It refills on the next job.
+- **Gradle still downloads from Maven Central.** Check that the job log has no
+  `maven-proxy: … does not answer` line, that the repository is one of the
+  three the proxy covers, and that the job does not move `GRADLE_USER_HOME`.
+  The init script lives in `~/.gradle/init.d`, so a different user home skips
+  it.
 - **Don't put `RUNNER_DATA_DIR` on NFS.** Slot locks use `flock`, which needs
   a local filesystem.
 

@@ -1,0 +1,90 @@
+// Gradle init script: resolve Maven Central, Google Maven and the Gradle Plugin
+// Portal through the host's `maven-proxy` service (docker-compose.yml), so a
+// host downloads each artifact once instead of once per runner slot (#45).
+// preflight-entrypoint.sh copies it into ~/.gradle/init.d of every slot.
+//
+// - MAVEN_PROXY_URL names the proxy. MAVEN_PROXY=off in a job's env opts that
+//   job out; on the runner it removes this script.
+// - The proxy is probed once per build. When it does not answer, nothing is
+//   changed and the build uses the upstream repositories as declared.
+// - Only repositories whose URL is one of those upstreams are redirected; any
+//   other repository (a company Nexus, mavenLocal(), a file repo) is left alone.
+// - Robolectric downloads its android-all jars itself at test time, from Maven
+//   Central by default; Test tasks are pointed at the proxy for that too.
+
+def proxy = (System.getenv('MAVEN_PROXY_URL') ?: '').trim().replaceAll('/+$', '')
+if (!proxy || System.getenv('MAVEN_PROXY') == 'off') {
+    return
+}
+
+def proxyUp = false
+try {
+    def conn = (HttpURLConnection) URI.create("${proxy}/healthz").toURL().openConnection(Proxy.NO_PROXY)
+    conn.connectTimeout = 2000
+    conn.readTimeout = 2000
+    proxyUp = conn.responseCode == 200
+    conn.disconnect()
+} catch (Exception ignored) {
+}
+if (!proxyUp) {
+    logger.warn("maven-proxy: ${proxy} does not answer; using the upstream repositories")
+    return
+}
+
+// A request that waits behind another slot's download of the same file gets no
+// bytes until that download completes (nginx proxy_cache_lock), so Gradle's 30 s
+// read timeout is too short for the largest jars. A value the build set wins.
+if (!System.getProperty('org.gradle.internal.http.socketTimeout')) {
+    System.setProperty('org.gradle.internal.http.socketTimeout', '600000')
+}
+
+def mirrors = [
+    'https://repo.maven.apache.org/maven2'   : "${proxy}/maven2".toString(),
+    'https://repo1.maven.org/maven2'         : "${proxy}/maven2".toString(),
+    'https://dl.google.com/dl/android/maven2': "${proxy}/google".toString(),
+    'https://maven.google.com'               : "${proxy}/google".toString(),
+    'https://plugins.gradle.org/m2'          : "${proxy}/plugins".toString(),
+]
+
+def redirect = { repositories ->
+    repositories.withType(MavenArtifactRepository).configureEach { repo ->
+        def url = repo.url
+        if (url instanceof Provider) {
+            url = url.getOrNull()
+        }
+        def target = mirrors[(url?.toString() ?: '').replaceAll('/+$', '')]
+        if (target) {
+            repo.url = target
+            repo.allowInsecureProtocol = target.startsWith('http:')
+        }
+    }
+}
+
+beforeSettings { settings ->
+    redirect(settings.buildscript.repositories)
+    redirect(settings.pluginManagement.repositories)
+    if (settings.hasProperty('dependencyResolutionManagement')) { // Gradle 6.8+
+        redirect(settings.dependencyResolutionManagement.repositories)
+    }
+}
+
+// With no plugin repositories declared, Gradle reads plugins from the portal
+// implicitly, past the hook above. Declaring the portal is the same thing, and
+// goes through the proxy. Settings plugins are resolved by then and still come
+// from upstream; project plugins do not.
+settingsEvaluated { settings ->
+    if (settings.pluginManagement.repositories.isEmpty()) {
+        settings.pluginManagement.repositories.gradlePluginPortal()
+    }
+}
+
+allprojects { project ->
+    redirect(project.buildscript.repositories)
+    redirect(project.repositories)
+    // Registered before the build script runs, so a value the project sets wins.
+    project.tasks.withType(Test).configureEach { test ->
+        test.systemProperty('robolectric.dependency.repo.url', "${proxy}/maven2".toString())
+    }
+}
+
+logger.info("maven-proxy: resolving Maven Central, Google Maven and the Plugin Portal through ${proxy}")

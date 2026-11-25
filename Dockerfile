@@ -200,6 +200,8 @@ CMD ["./bin/Runner.Listener", "run", "--startuptype", "service"]
 ################################################################################
 FROM scratch AS scripts
 COPY --chmod=755 preflight-entrypoint.sh pre-job.sh cleanup.sh pruner.sh /usr/local/bin/
+# Gradle init script for the host's maven-proxy; the preflight installs it.
+COPY --chmod=644 maven-proxy/maven-proxy.gradle /usr/local/share/github-runner/
 
 ################################################################################
 # runner-slim (`--target runner-slim`): core without the Android SDK

@@ -14,6 +14,8 @@
 #        unless RUNNER_CACHES=off (small hosts, control runners).
 #    pre-job.sh / cleanup.sh mark the slot busy for pruner.sh through
 #    RUNNER_SLOT_DIR.
+#    It also installs the Gradle init script that resolves through the host's
+#    maven-proxy (setup_maven_proxy).
 #
 # 2. Registration check. When CONFIGURED_ACTIONS_RUNNER_FILES_DIR is set, the upstream entrypoint
 # copies the persisted config into /actions-runner and skips registration
@@ -126,6 +128,27 @@ ensure_rustup() {
     log "rustup installed into $HOME/.cargo"
   else
     log "rustup-init failed; jobs install rustup themselves"
+  fi
+}
+
+# Install the init script that sends Gradle through the host's maven-proxy
+# (docker-compose.yml) into ~/.gradle/init.d, the slot's Gradle cache when
+# caches are on. Copied, not linked, so a slot never points at a file an older
+# or newer image lacks; rewritten only when the image's copy differs.
+# MAVEN_PROXY=off, or no MAVEN_PROXY_URL (the image outside compose), removes it.
+MAVEN_PROXY_INIT_SRC=/usr/local/share/github-runner/maven-proxy.gradle
+setup_maven_proxy() {
+  local dst="${HOME:-/root}/.gradle/init.d/maven-proxy.gradle"
+  if [ "${MAVEN_PROXY:-on}" = off ] || [ -z "${MAVEN_PROXY_URL:-}" ]; then
+    rm -f "$dst"
+    return 0
+  fi
+  [ -f "$MAVEN_PROXY_INIT_SRC" ] || return 0
+  cmp -s "$MAVEN_PROXY_INIT_SRC" "$dst" && return 0
+  if mkdir -p "${dst%/*}" && cp "$MAVEN_PROXY_INIT_SRC" "$dst"; then
+    log "gradle resolves through $MAVEN_PROXY_URL when it answers"
+  else
+    log "cannot install $dst; gradle resolves upstream"
   fi
 }
 
@@ -255,6 +278,7 @@ preflight() {
 [ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 
 setup_slot
+setup_maven_proxy
 ensure_rustup
 tune_parallelism
 preflight
