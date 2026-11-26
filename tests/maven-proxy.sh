@@ -3,15 +3,15 @@
 # docker-compose.yml, its init script and the preflight that installs it.
 #   - the preflight installs maven-proxy/maven-proxy.gradle into
 #     ~/.gradle/init.d and replaces a stale copy;
-#   - the proxy, started from the real compose file against a fake upstream,
-#     serves Maven Central, Google Maven and the Plugin Portal from their own
+#   - the proxy, started from the real compose file against a fake HTTPS
+#     upstream whose certificate chains through two intermediate CAs, serves Maven Central, Google Maven and the Plugin Portal from their own
 #     prefixes, fetches a file once however often and however concurrently it
 #     is asked for, follows the portal's redirects into its cache, and never
 #     caches a 429;
 #   - with gradle on PATH: the init script redirects only the three upstream
 #     repositories (and Robolectric), resolves through the proxy, and leaves
 #     everything as declared when the proxy is down or MAVEN_PROXY=off.
-# The proxy part needs docker, the last part gradle and java; each is skipped,
+# The proxy part needs docker and openssl, the last part gradle and java; each is skipped,
 # with a note, when missing.
 #   bash tests/maven-proxy.sh
 # shellcheck disable=SC2030,SC2031  # ( ... ) groups are runner containers
@@ -41,8 +41,8 @@ install_init >/dev/null
 cmp -s "$root/maven-proxy/maven-proxy.gradle" "$init" || fail "a stale init script was not replaced"
 install_init MAVEN_PROXY_INIT_SRC="$work/missing" >/dev/null || fail "a missing source failed the preflight"
 
-if ! docker info >/dev/null 2>&1; then
-  echo "SKIP: no docker; the proxy itself is not tested"
+if ! docker info >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+  echo "SKIP: no docker or openssl; the proxy itself is not tested"
   finish "maven-proxy: preflight install"
   exit 0
 fi
@@ -51,17 +51,43 @@ fi
 # The real compose file, its maven-proxy service pointed at an `upstream` nginx
 # that the override adds and publishes nothing. RUNNER_DATA_DIR holds the cache.
 export RUNNER_DATA_DIR="$work/data"
-export MAVEN_CENTRAL_URL=http://upstream/maven2
-export GOOGLE_MAVEN_URL=http://upstream/google
-export GRADLE_PLUGIN_PORTAL_URL=http://upstream/plugins
+export MAVEN_CENTRAL_URL=https://upstream/maven2
+export GOOGLE_MAVEN_URL=https://upstream/google
+export GRADLE_PLUGIN_PORTAL_URL=https://upstream/plugins
+# The upstream's certificate chains like Maven Central's: two CAs between the
+# leaf and a root the proxy trusts (Let's Encrypt's Root YE, cross-signed, is
+# not in Alpine's bundle). The proxy trusts only the test root.
+pki="$work/pki"
+mkdir -p "$pki"
+printf 'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n' >"$pki/ca.ext"
+printf 'basicConstraints=critical,CA:FALSE\nsubjectAltName=DNS:upstream\nextendedKeyUsage=serverAuth\n' >"$pki/leaf.ext"
+# cert <name> <CN> <ext file> [<issuer name>]: a key and a certificate, self-signed without an issuer.
+cert() {
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$pki/$1.key" 2>/dev/null
+  openssl req -new -key "$pki/$1.key" -subj "/CN=$2" -out "$pki/$1.csr" 2>/dev/null
+  if [ -z "${4:-}" ]; then
+    openssl x509 -req -in "$pki/$1.csr" -signkey "$pki/$1.key" -days 2 -extfile "$pki/$3" -out "$pki/$1.pem" 2>/dev/null
+  else
+    openssl x509 -req -in "$pki/$1.csr" -CA "$pki/$4.pem" -CAkey "$pki/$4.key" -set_serial "$RANDOM" -days 2 \
+      -extfile "$pki/$3" -out "$pki/$1.pem" 2>/dev/null
+  fi
+}
+cert root test-root ca.ext
+cert ca1 test-ca-1 ca.ext root
+cert ca2 test-ca-2 ca.ext ca1
+cert leaf upstream leaf.ext ca2
+cat "$pki/leaf.pem" "$pki/ca2.pem" "$pki/ca1.pem" >"$pki/chain.pem"
+chmod -R a+rX "$pki"
 proxy_image=$(awk '/^  maven-proxy:/{s=1} s && /image:/{print $2; exit}' "$root/docker-compose.yml")
 mkdir -p "$RUNNER_DATA_DIR/maven-proxy" "$work/srv"
 cat >"$work/upstream.conf" <<'EOF'
 server {
-    listen 80;
+    listen 443 ssl;
+    ssl_certificate /pki/chain.pem;
+    ssl_certificate_key /pki/leaf.key;
     root /srv;
     location /maven2/limited/ { return 429; }
-    location = /plugins/redir/a/1.0/a-1.0.jar { return 302 http://upstream/files/a-1.0.jar; }
+    location = /plugins/redir/a/1.0/a-1.0.jar { return 302 https://upstream/files/a-1.0.jar; }
     location = /plugins/redir/b/1.0/b-1.0.jar { absolute_redirect off; return 302 /files/b-1.0.jar; }
     location /maven2/slow/ { limit_rate 2m; }
 }
@@ -70,11 +96,14 @@ cat >"$work/test.compose.yml" <<EOF
 services:
   maven-proxy:
     ports: ["127.0.0.1::8080"]
+    volumes:
+      - $pki/root.pem:/etc/ssl/certs/ca-certificates.crt:ro
   upstream:
     image: $proxy_image
     volumes:
       - $work/upstream.conf:/etc/nginx/conf.d/default.conf:ro
       - $work/srv:/srv:ro
+      - $pki:/pki:ro
 EOF
 artifact() { mkdir -p "$(dirname "$work/srv/$1")" && head -c "$2" /dev/urandom >"$work/srv/$1"; }
 artifact maven2/org/ex/lib/1.0/lib-1.0.jar 100000
