@@ -5,6 +5,7 @@
 # Gradle caches. Maven Central rate-limits large files per IP (issue #45).
 #
 #   /maven2/<path>    Maven Central         ${MAVEN_CENTRAL_URL}
+#                     its 429 or 5xx:       ${MAVEN_CENTRAL_MIRROR_URL}
 #   /google/<path>    Google Maven          ${GOOGLE_MAVEN_URL}
 #   /plugins/<path>   Gradle Plugin Portal  ${GRADLE_PLUGIN_PORTAL_URL}
 #   /healthz          200 while nginx runs: the init script's probe
@@ -89,14 +90,46 @@ server {
     }
 
     # maven-metadata.xml lists a module's versions and does change: a short TTL.
-    location ~ ^/(?<repo>maven2|google|plugins)/(?<path>(?:.*/)?maven-metadata\.xml(?:\.[a-z0-9]+)?)$ {
+    # Regex locations match in order, so these come before the artifact ones.
+    location ~ ^/(?<repo>maven2)/(?<path>(?:.*/)?maven-metadata\.xml(?:\.[a-z0-9]+)?)$ {
+        proxy_cache_valid 200 10m;
+        proxy_cache_valid 404 1m;
+        error_page 429 500 502 503 504 = @central_mirror_metadata;
+        # Declaring error_page here drops the server's; keep its redirects.
+        error_page 301 302 303 307 308 = @redirect;
+        proxy_pass $upstream_base/$path;
+    }
+
+    location ~ ^/(?<repo>google|plugins)/(?<path>(?:.*/)?maven-metadata\.xml(?:\.[a-z0-9]+)?)$ {
         proxy_cache_valid 200 10m;
         proxy_cache_valid 404 1m;
         proxy_pass $upstream_base/$path;
     }
 
-    location ~ ^/(?<repo>maven2|google|plugins)/(?<path>.+)$ {
+    location ~ ^/(?<repo>maven2)/(?<path>.+)$ {
+        error_page 429 500 502 503 504 = @central_mirror;
+        # Declaring error_page here drops the server's; keep its redirects.
+        error_page 301 302 303 307 308 = @redirect;
         proxy_pass $upstream_base/$path;
+    }
+
+    location ~ ^/(?<repo>google|plugins)/(?<path>.+)$ {
+        proxy_pass $upstream_base/$path;
+    }
+
+    # Maven Central limits large files per IP and per file, for hours, and a
+    # cold cache cannot fill from a 429. Central's 429 or 5xx sends the request
+    # on to a mirror of Central; its 200 is cached under the same key, so the
+    # next request is a HIT. The mirror's own error goes to the client.
+    # Google Maven and the Plugin Portal have no mirror.
+    location @central_mirror {
+        proxy_pass ${MAVEN_CENTRAL_MIRROR_URL}/$path;
+    }
+
+    location @central_mirror_metadata {
+        proxy_cache_valid 200 10m;
+        proxy_cache_valid 404 1m;
+        proxy_pass ${MAVEN_CENTRAL_MIRROR_URL}/$path;
     }
 
     location @redirect {

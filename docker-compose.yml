@@ -140,8 +140,10 @@ services:
     image: nginx:1.31.10-alpine
     restart: unless-stopped
     environment:
-      NGINX_ENVSUBST_FILTER: ^(MAVEN_CENTRAL_URL|GOOGLE_MAVEN_URL|GRADLE_PLUGIN_PORTAL_URL|MAVEN_PROXY_MAX_SIZE)$$
+      NGINX_ENVSUBST_FILTER: ^(MAVEN_CENTRAL_URL|MAVEN_CENTRAL_MIRROR_URL|GOOGLE_MAVEN_URL|GRADLE_PLUGIN_PORTAL_URL|MAVEN_PROXY_MAX_SIZE)$$
       MAVEN_CENTRAL_URL: ${MAVEN_CENTRAL_URL:-https://repo.maven.apache.org/maven2}
+      # Asked when Central answers 429 or 5xx (README "Maven proxy").
+      MAVEN_CENTRAL_MIRROR_URL: ${MAVEN_CENTRAL_MIRROR_URL:-https://maven-central.storage-download.googleapis.com/maven2}
       GOOGLE_MAVEN_URL: ${GOOGLE_MAVEN_URL:-https://dl.google.com/dl/android/maven2}
       GRADLE_PLUGIN_PORTAL_URL: ${GRADLE_PLUGIN_PORTAL_URL:-https://plugins.gradle.org/m2}
       MAVEN_PROXY_MAX_SIZE: ${MAVEN_PROXY_MAX_SIZE:-20g}
