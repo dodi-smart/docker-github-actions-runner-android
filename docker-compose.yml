@@ -137,7 +137,7 @@ services:
   # scaled to 0 (`docker compose up -d --scale maven-proxy=0`), Gradle goes
   # upstream. Only the compose network reaches it; no port is published.
   maven-proxy:
-    image: nginx:1.31.9-alpine
+    image: nginx:1.31.10-alpine
     restart: unless-stopped
     environment:
       NGINX_ENVSUBST_FILTER: ^(MAVEN_CENTRAL_URL|GOOGLE_MAVEN_URL|GRADLE_PLUGIN_PORTAL_URL|MAVEN_PROXY_MAX_SIZE)$$
