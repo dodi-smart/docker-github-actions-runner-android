@@ -124,7 +124,7 @@ artifact files/b-1.0.jar 1000
 # On the mirror only: Central refuses (limited/) or fails (broken/) for these.
 artifact mirror/limited/x/1.0/x-1.0.jar 1000
 artifact mirror/broken/y/1.0/y-1.0.jar 1000
-echo '<metadata/>' >"$work/srv/mirror/limited/x/maven-metadata.xml"
+artifact mirror/limited/x/maven-metadata.xml 100
 chmod -R a+rX "$work/srv"
 
 # compose <args>: the test project. The App variables are unset here, and
@@ -163,8 +163,9 @@ get() {
   rm -f "$headers" "$body"
 }
 sha() { sha256sum <"$work/srv/$1" | cut -d' ' -f1; }
-# upstream_hits <path>: how often the upstream was asked for <path>.
-upstream_hits() { compose logs --no-log-prefix upstream 2>/dev/null | grep -c "\"GET $1 " || true; }
+# upstream_hits <path>: how often the upstream was asked for <path>. Access-log
+# lines only: its error log quotes the request too, for each file it lacks.
+upstream_hits() { compose logs --no-log-prefix upstream 2>/dev/null | grep -Ec "\"GET $1 HTTP/[0-9.]+\" [0-9]{3} " || true; }
 
 # Each prefix reaches its repository; the second request is a cache hit.
 for p in maven2/org/ex/lib/1.0/lib-1.0.jar google/com/g/lib/1.0/lib-1.0.jar plugins/p/lib/1.0/lib-1.0.jar; do
@@ -202,10 +203,11 @@ first=$(get "/$p")
 # Central's 429 or 5xx: the mirror serves the file, and it is cached, so the
 # second request asks neither.
 for p in limited/x/1.0/x-1.0.jar broken/y/1.0/y-1.0.jar; do
+  want=$(sha "mirror/$p")
   first=$(get "/maven2/$p")
-  [ "${first%% *} ${first##* }" = "200 $(sha "mirror/$p")" ] || fail "/maven2/$p via the mirror: $first"
+  [ "${first%% *} ${first##* }" = "200 $want" ] || fail "/maven2/$p via the mirror: $first"
   second=$(get "/maven2/$p")
-  [ "$second" = "200 HIT $(sha "mirror/$p")" ] || fail "/maven2/$p from the mirror not cached: $second"
+  [ "$second" = "200 HIT $want" ] || fail "/maven2/$p from the mirror not cached: $second"
   [ "$(upstream_hits "/maven2/$p")" = 1 ] || fail "/maven2/$p asked Central $(upstream_hits "/maven2/$p") times, want 1"
   [ "$(upstream_hits "/mirror/$p")" = 1 ] || fail "/maven2/$p asked the mirror $(upstream_hits "/mirror/$p") times, want 1"
 done
@@ -219,10 +221,17 @@ p=limited/gone/z/1.0/z-1.0.jar
 [ "$(get "/maven2/$p" | cut -d' ' -f1)" = 429 ] || fail "429 not passed through the second time"
 [ "$(upstream_hits "/maven2/$p")" = 2 ] || fail "429 was cached ($(upstream_hits "/maven2/$p") Central requests, want 2)"
 [ "$(upstream_hits "/mirror/$p")" = 2 ] || fail "mirror's 429 was cached ($(upstream_hits "/mirror/$p") requests, want 2)"
+# A file the mirror lacks after Central's 503: the 404 passes through uncached,
+# so the next request asks Central again (the mirror lags Central).
+p=broken/new/1.0/new-1.0.jar
+[ "$(get "/maven2/$p" | cut -d' ' -f1)" = 404 ] || fail "mirror's 404 not passed through"
+[ "$(get "/maven2/$p" | cut -d' ' -f1)" = 404 ] || fail "mirror's 404 not passed through the second time"
+[ "$(upstream_hits "/maven2/$p")" = 2 ] || fail "mirror's 404 was cached ($(upstream_hits "/maven2/$p") Central requests, want 2)"
+[ "$(upstream_hits "/mirror/$p")" = 2 ] || fail "mirror's 404 was cached ($(upstream_hits "/mirror/$p") mirror requests, want 2)"
 # Google Maven has no mirror: its 429 passes through.
-p=/google/limited/x/1.0/x-1.0.jar
-[ "$(get "$p" | cut -d' ' -f1)" = 429 ] || fail "Google Maven's 429 not passed through"
-[ "$(upstream_hits /mirror/limited/x/1.0/x-1.0.jar)" = 1 ] || fail "Google Maven's 429 reached the mirror"
+p=limited/w/1.0/w-1.0.jar
+[ "$(get "/google/$p" | cut -d' ' -f1)" = 429 ] || fail "Google Maven's 429 not passed through"
+[ "$(upstream_hits "/mirror/$p")" = 0 ] || fail "Google Maven's 429 reached the mirror"
 
 # Metadata is cached too (briefly); a missing file is a 404; other paths never
 # reach upstream.

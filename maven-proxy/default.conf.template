@@ -120,15 +120,19 @@ server {
     # Maven Central limits large files per IP and per file, for hours, and a
     # cold cache cannot fill from a 429. Central's 429 or 5xx sends the request
     # on to a mirror of Central; its 200 is cached under the same key, so the
-    # next request is a HIT. The mirror's own error goes to the client.
-    # Google Maven and the Plugin Portal have no mirror.
+    # next request is a HIT. The mirror's own error goes to the client, and so
+    # does its 404, uncached: the mirror lags Central, so a file it lacks may
+    # well be on Central once Central answers again. The mirror must serve files
+    # itself: a redirect from it is not followed. Google Maven and the Plugin
+    # Portal have no mirror.
     location @central_mirror {
+        # Restates the server's 200 so the server's 404 lifetime is not inherited.
+        proxy_cache_valid 200 365d;
         proxy_pass ${MAVEN_CENTRAL_MIRROR_URL}/$path;
     }
 
     location @central_mirror_metadata {
         proxy_cache_valid 200 10m;
-        proxy_cache_valid 404 1m;
         proxy_pass ${MAVEN_CENTRAL_MIRROR_URL}/$path;
     }
 
