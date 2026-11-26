@@ -6,8 +6,9 @@
 #   - the proxy, started from the real compose file against a fake HTTPS
 #     upstream whose certificate chains through two intermediate CAs, serves Maven Central, Google Maven and the Plugin Portal from their own
 #     prefixes, fetches a file once however often and however concurrently it
-#     is asked for, follows the portal's redirects into its cache, and never
-#     caches a 429;
+#     is asked for, follows the portal's redirects into its cache, never
+#     caches a 429, and on Central's 429 or 5xx fetches from the Central mirror
+#     and caches that;
 #   - with gradle on PATH: the init script redirects only the three upstream
 #     repositories (and Robolectric), resolves through the proxy, and leaves
 #     everything as declared when the proxy is down or MAVEN_PROXY=off.
@@ -52,6 +53,7 @@ fi
 # that the override adds and publishes nothing. RUNNER_DATA_DIR holds the cache.
 export RUNNER_DATA_DIR="$work/data"
 export MAVEN_CENTRAL_URL=https://upstream/maven2
+export MAVEN_CENTRAL_MIRROR_URL=https://upstream/mirror
 export GOOGLE_MAVEN_URL=https://upstream/google
 export GRADLE_PLUGIN_PORTAL_URL=https://upstream/plugins
 # The upstream's certificate chains like Maven Central's: two CAs between the
@@ -87,6 +89,9 @@ server {
     ssl_certificate_key /pki/leaf.key;
     root /srv;
     location /maven2/limited/ { return 429; }
+    location /maven2/broken/ { return 503; }
+    location /google/limited/ { return 429; }
+    location /mirror/limited/gone/ { return 429; }
     location = /plugins/redir/a/1.0/a-1.0.jar { return 302 https://upstream/files/a-1.0.jar; }
     location = /plugins/redir/b/1.0/b-1.0.jar { absolute_redirect off; return 302 /files/b-1.0.jar; }
     location /maven2/slow/ { limit_rate 2m; }
@@ -116,6 +121,10 @@ artifact google/com/g/lib/1.0/lib-1.0.jar 1000
 artifact plugins/p/lib/1.0/lib-1.0.jar 1000
 artifact files/a-1.0.jar 1000
 artifact files/b-1.0.jar 1000
+# On the mirror only: Central refuses (limited/) or fails (broken/) for these.
+artifact mirror/limited/x/1.0/x-1.0.jar 1000
+artifact mirror/broken/y/1.0/y-1.0.jar 1000
+echo '<metadata/>' >"$work/srv/mirror/limited/x/maven-metadata.xml"
 chmod -R a+rX "$work/srv"
 
 # compose <args>: the test project. The App variables are unset here, and
@@ -190,11 +199,30 @@ p=plugins/redir/b/1.0/b-1.0.jar
 first=$(get "/$p")
 [ "${first%% *} ${first##* }" = "200 $(sha files/b-1.0.jar)" ] || fail "relative redirect: $first"
 
-# A 429 passes through and is not cached: the next request asks again.
-p=/maven2/limited/x/1.0/x-1.0.jar
-[ "$(get "$p" | cut -d' ' -f1)" = 429 ] || fail "429 not passed through"
-[ "$(get "$p" | cut -d' ' -f1)" = 429 ] || fail "429 not passed through the second time"
-[ "$(upstream_hits "$p")" = 2 ] || fail "429 was cached ($(upstream_hits "$p") upstream requests, want 2)"
+# Central's 429 or 5xx: the mirror serves the file, and it is cached, so the
+# second request asks neither.
+for p in limited/x/1.0/x-1.0.jar broken/y/1.0/y-1.0.jar; do
+  first=$(get "/maven2/$p")
+  [ "${first%% *} ${first##* }" = "200 $(sha "mirror/$p")" ] || fail "/maven2/$p via the mirror: $first"
+  second=$(get "/maven2/$p")
+  [ "$second" = "200 HIT $(sha "mirror/$p")" ] || fail "/maven2/$p from the mirror not cached: $second"
+  [ "$(upstream_hits "/maven2/$p")" = 1 ] || fail "/maven2/$p asked Central $(upstream_hits "/maven2/$p") times, want 1"
+  [ "$(upstream_hits "/mirror/$p")" = 1 ] || fail "/maven2/$p asked the mirror $(upstream_hits "/mirror/$p") times, want 1"
+done
+# Metadata falls back too.
+p=limited/x/maven-metadata.xml
+[ "$(get "/maven2/$p" | cut -d' ' -f1,3)" = "200 $(sha "mirror/$p")" ] || fail "metadata not taken from the mirror"
+
+# When the mirror refuses too, its 429 passes through and is not cached.
+p=limited/gone/z/1.0/z-1.0.jar
+[ "$(get "/maven2/$p" | cut -d' ' -f1)" = 429 ] || fail "429 not passed through"
+[ "$(get "/maven2/$p" | cut -d' ' -f1)" = 429 ] || fail "429 not passed through the second time"
+[ "$(upstream_hits "/maven2/$p")" = 2 ] || fail "429 was cached ($(upstream_hits "/maven2/$p") Central requests, want 2)"
+[ "$(upstream_hits "/mirror/$p")" = 2 ] || fail "mirror's 429 was cached ($(upstream_hits "/mirror/$p") requests, want 2)"
+# Google Maven has no mirror: its 429 passes through.
+p=/google/limited/x/1.0/x-1.0.jar
+[ "$(get "$p" | cut -d' ' -f1)" = 429 ] || fail "Google Maven's 429 not passed through"
+[ "$(upstream_hits /mirror/limited/x/1.0/x-1.0.jar)" = 1 ] || fail "Google Maven's 429 reached the mirror"
 
 # Metadata is cached too (briefly); a missing file is a 404; other paths never
 # reach upstream.

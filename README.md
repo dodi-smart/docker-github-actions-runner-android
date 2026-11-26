@@ -358,6 +358,11 @@ every slot on the host resolves through:
   that goes away during a build fails that build's downloads, so recreate
   `maven-proxy` (an nginx bump, for example) while the runners are idle, as
   with the runners themselves.
+- **It goes around Central's limit.** When Maven Central answers `429` or a
+  5xx, the proxy fetches the same path from a mirror of Central
+  (`MAVEN_CENTRAL_MIRROR_URL`, Google's by default) and caches that copy, so a
+  cold cache fills even while Central limits the host. Only the mirror's own
+  error reaches Gradle. Google Maven and the Plugin Portal have no mirror.
 - **It is bounded.** The cache lives in `RUNNER_DATA_DIR/maven-proxy`, outside
   the slots; what it holds, up to half of the pruner's host budget, comes off
   that budget before it is split across the slots. nginx evicts the least recently used
@@ -414,6 +419,7 @@ comments.
 | `MAVEN_PROXY` | `on` | `off` makes Gradle resolve upstream directly (see [Maven proxy](#maven-proxy)) |
 | `MAVEN_PROXY_MAX_SIZE` | `20g` | size limit of the proxy's cache |
 | `MAVEN_CENTRAL_URL`, `GOOGLE_MAVEN_URL`, `GRADLE_PLUGIN_PORTAL_URL` | the public repositories | what the proxy fetches from, e.g. a closer mirror |
+| `MAVEN_CENTRAL_MIRROR_URL` | `https://maven-central.storage-download.googleapis.com/maven2` | where the proxy fetches from when Central answers `429` or 5xx; set it to `MAVEN_CENTRAL_URL` to turn that off |
 | `DISABLE_AUTO_UPDATE` | empty | any non-empty value (even `false`) disables runner self-update |
 
 `EPHEMERAL` and `DISABLE_AUTO_UPDATE` count as set for any non-empty value,
