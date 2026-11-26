@@ -419,7 +419,7 @@ comments.
 | `MAVEN_PROXY` | `on` | `off` makes Gradle resolve upstream directly (see [Maven proxy](#maven-proxy)) |
 | `MAVEN_PROXY_MAX_SIZE` | `20g` | size limit of the proxy's cache |
 | `MAVEN_CENTRAL_URL`, `GOOGLE_MAVEN_URL`, `GRADLE_PLUGIN_PORTAL_URL` | the public repositories | what the proxy fetches from, e.g. a closer mirror |
-| `MAVEN_CENTRAL_MIRROR_URL` | `https://maven-central.storage-download.googleapis.com/maven2` | where the proxy fetches from when Central answers `429` or 5xx; set it to `MAVEN_CENTRAL_URL` to turn that off |
+| `MAVEN_CENTRAL_MIRROR_URL` | `https://maven-central.storage-download.googleapis.com/maven2` | where the proxy fetches from when Central answers `429` or 5xx; must serve files itself, not redirect (set to `MAVEN_CENTRAL_URL`, it only asks Central again) |
 | `DISABLE_AUTO_UPDATE` | empty | any non-empty value (even `false`) disables runner self-update |
 
 `EPHEMERAL` and `DISABLE_AUTO_UPDATE` count as set for any non-empty value,
