@@ -1,0 +1,107 @@
+# Host-wide caching proxy for Maven repositories: the `maven-proxy` service of
+# docker-compose.yml. Every runner slot of a host resolves through it (see
+# maven-proxy.gradle), so the host downloads each artifact from upstream once,
+# however many slots ask for it and however often the pruner evicts their own
+# Gradle caches. Maven Central rate-limits large files per IP (issue #45).
+#
+#   /maven2/<path>    Maven Central         ${MAVEN_CENTRAL_URL}
+#   /google/<path>    Google Maven          ${GOOGLE_MAVEN_URL}
+#   /plugins/<path>   Gradle Plugin Portal  ${GRADLE_PLUGIN_PORTAL_URL}
+#   /healthz          200 while nginx runs: the init script's probe
+#
+# The ${...} values come from the service environment: the nginx image fills
+# them in when the container starts (NGINX_ENVSUBST_FILTER limits that to the
+# names above, so nginx's own $variables stay as they are).
+
+log_format maven '$remote_addr "$request" $status $body_bytes_sent '
+                 'cache=$upstream_cache_status $request_time';
+
+# LRU-bounded by MAVEN_PROXY_MAX_SIZE; an entry nobody asked for in 90 days goes
+# even below that. 16m of keys holds ~128k artifacts.
+proxy_cache_path /var/cache/maven-proxy levels=1:2 keys_zone=maven:16m
+                 max_size=${MAVEN_PROXY_MAX_SIZE} inactive=90d use_temp_path=off;
+
+map $repo $upstream_base {
+    maven2  "${MAVEN_CENTRAL_URL}";
+    google  "${GOOGLE_MAVEN_URL}";
+    plugins "${GRADLE_PLUGIN_PORTAL_URL}";
+}
+
+# proxy_pass needs an absolute URL: a redirect to a path alone (/files/x.jar)
+# is resolved against the origin of the upstream that sent it.
+map $upstream_base $upstream_origin {
+    "~^(https?://[^/]+)" $1;
+}
+map $upstream_http_location $redirect_url {
+    "~^/"   $upstream_origin$upstream_http_location;
+    default $upstream_http_location;
+}
+
+server {
+    listen 8080;
+    access_log /dev/stdout maven;
+
+    # Docker's embedded DNS, asked per request: the proxy starts, and serves
+    # what it has cached, while upstream DNS is down.
+    resolver 127.0.0.11 valid=300s ipv6=off;
+    resolver_timeout 5s;
+
+    proxy_cache maven;
+    proxy_cache_key $uri;
+    # Releases never change: keep a 200 until LRU or `inactive` drops it. A 404
+    # is cached briefly, because Gradle asks every repository in turn. Nothing
+    # else (429, 5xx) is cached, so the next request tries upstream again.
+    proxy_cache_valid 200 365d;
+    proxy_cache_valid 404 10m;
+    # Concurrent misses for one file wait for a single upstream download instead
+    # of each starting their own; a 190 MB jar can take minutes on a slow line.
+    # Waiters get no bytes until it finishes, which is why maven-proxy.gradle
+    # raises Gradle's 30 s read timeout.
+    proxy_cache_lock on;
+    proxy_cache_lock_timeout 10m;
+    proxy_cache_lock_age 10m;
+    proxy_cache_use_stale error timeout updating http_429 http_500 http_502 http_503 http_504;
+    proxy_ignore_headers Cache-Control Expires Set-Cookie Vary X-Accel-Expires;
+    proxy_hide_header Set-Cookie;
+    add_header X-Cache-Status $upstream_cache_status always;
+
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_ssl_server_name on;
+    proxy_ssl_verify on;
+    proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+    proxy_connect_timeout 15s;
+    proxy_read_timeout 120s;
+    # The Plugin Portal answers with a redirect to its artifact host. Follow it
+    # here and cache the file under this request's URI, so the client never
+    # leaves the proxy.
+    proxy_intercept_errors on;
+    error_page 301 302 303 307 308 = @redirect;
+
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # maven-metadata.xml lists a module's versions and does change: a short TTL.
+    location ~ ^/(?<repo>maven2|google|plugins)/(?<path>(?:.*/)?maven-metadata\.xml(?:\.[a-z0-9]+)?)$ {
+        proxy_cache_valid 200 10m;
+        proxy_cache_valid 404 1m;
+        proxy_pass $upstream_base/$path;
+    }
+
+    location ~ ^/(?<repo>maven2|google|plugins)/(?<path>.+)$ {
+        proxy_pass $upstream_base/$path;
+    }
+
+    location @redirect {
+        # Read before proxy_pass starts a new upstream, which clears it.
+        set $redirect_target $redirect_url;
+        proxy_pass $redirect_target;
+    }
+
+    location / {
+        return 404;
+    }
+}

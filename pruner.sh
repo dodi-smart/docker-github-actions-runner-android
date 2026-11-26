@@ -10,8 +10,10 @@
 #      evictable is described by STORE_TABLE below: caches whose entries are only
 #      valid whole (bun packages, gradle versions, mise tool versions, ...) evict
 #      whole directories, the rest evict single files.
-#   2. docker system prune / builder prune on the host daemon (docker.sock).
-#   3. Hourly, in the background: fill the shared action archive cache.
+#   2. A size limit per slot on its work dir (slots/<id>/work): whole repo
+#      checkouts go, least recently used first.
+#   3. docker system prune / builder prune on the host daemon (docker.sock).
+#   4. Hourly, in the background: fill the shared action archive cache.
 #
 # Job safety: a slot is pruned only while holding its `.prune.lock` (pre-job.sh
 # waits on it) and only when it is not mid-job: a `busy` marker younger than 6 h
@@ -33,7 +35,10 @@
 #   CACHE_BUDGET_BYTES       total cache budget over all slots   (60 GiB)
 #   CACHE_BUDGET_PCT         ... capped to this % of the filesystem holding
 #                            RUNNER_DATA_DIR (40); the smaller wins and is split
-#                            evenly between the slots
+#                            evenly between the active slots
+#   SLOT_IDLE_DAYS           a slot no runner opened for this long is idle:
+#                            no budget share, emptied (7)
+#   WORK_BUDGET_BYTES        work dir limit per slot (10 GiB; 0 = no limit)
 #   PRUNE_CHECK_SECONDS      df check period                       (3600)
 #   PRUNE_FREE_PCT           full pass when free space is below    (5)
 #   PRUNE_INTERVAL_SECONDS   full pass at least this often         (86400)
@@ -61,6 +66,8 @@ CACHE_BUDGET_PCT="${CACHE_BUDGET_PCT:-40}"
 PRUNE_CHECK_SECONDS="${PRUNE_CHECK_SECONDS:-3600}"
 PRUNE_FREE_PCT="${PRUNE_FREE_PCT:-5}"
 PRUNE_INTERVAL_SECONDS="${PRUNE_INTERVAL_SECONDS:-86400}"
+SLOT_IDLE_DAYS="${SLOT_IDLE_DAYS:-7}"
+WORK_BUDGET_BYTES="${WORK_BUDGET_BYTES:-10737418240}" # 10 GiB
 BUSY_STALE_MINUTES=360 # a `busy` marker older than 6 h is a crashed job's leftover
 ACTION_CACHE_DIR=/opt/actionarchivecache # mount point in docker-compose.yml
 ACTION_CACHE_CAP_BYTES="${ACTION_CACHE_CAP_BYTES:-2147483648}" # 2 GiB
@@ -75,6 +82,10 @@ DOCKER_PRUNE_KEEP_IMAGES="${DOCKER_PRUNE_KEEP_IMAGES:-}"
 
 log() { echo "[pruner] $(date -u +%FT%TZ) $*"; }
 
+# younger_than <path> <find age test> <value>: $1 exists and passes the test,
+# e.g. `younger_than "$slot/busy" -mmin -360`.
+younger_than() { [ -n "$(find "$1" -maxdepth 0 "$2" "$3" 2>/dev/null)" ]; }
+
 # Evictable units per store, one rule per line: store|kind|glob|skip|opts
 #   kind d: every directory matching glob (relative to the store dir, never a
 #           symlink) is one unit, removed whole; skip is a case pattern for the
@@ -86,12 +97,21 @@ log() { echo "[pruner] $(date -u +%FT%TZ) $*"; }
 #   opts:   comma-separated. shared: not a runner-slot store (the action archive
 #           cache). key=<file>: LRU order of a dir unit is the atime of <unit>/<file>
 #           (the unit's mtime when it has none), not the newest atime of any file.
+#           work: the slot's work dir, limited by WORK_BUDGET_BYTES on its own.
 # Globs use * and ? only; like the shell, they skip names starting with a dot.
+# Gradle 8 keeps artifact transforms in caches/transforms-*, Gradle 9 in
+# caches/<gradle version>/transforms. Either can outgrow every downloaded
+# dependency (23 GB against 1 GB of modules-2 on a busy Android slot); left
+# out, the LRU could only free space by evicting dependencies, which jobs then
+# download again (Maven Central's per-IP 429s, issue #45).
 # Anything no rule matches (bun's bin/ and @t@ piles, cargo's bin/ and registry
 # index, rustup's settings.toml, ...) is never touched. The few stores needing
 # more than a rule are in store_hook. Leftovers of killed bun extractions
 # (*.tmp, *.part) are pre-job.sh's job: it sweeps them before the next job of a
 # crashed slot.
+# work/<repo> is the checkout of a repo the slot has built, reused by its next
+# job and created again by the runner when missing; work/_* (actions, temp,
+# the repo-to-dir mapping) is the runner's own.
 STORE_TABLE='
 bun|d|install/cache/*@*|install/cache/@*|key=package.json
 bun|d|install/cache/@*/*@*|install/cache/@t@/*|key=package.json
@@ -99,6 +119,7 @@ npm|f|_cacache|*|
 pnpm|d|.||
 gradle|d|caches/modules-2/files-2.1/*/*/*||
 gradle|d|caches/transforms-*/*||
+gradle|d|caches/*/transforms/*||
 gradle|d|wrapper/dists/*||
 gradle|d|caches/jars-*/*||
 gradle|f|caches/build-cache-1|*|
@@ -116,11 +137,13 @@ toolcache|d|*/*||
 mise-cache|f|.|*|
 hk|f|.|*|
 actions|f|.|*|shared
+work|d|*|_*|work
 '
 
-# Stores of a runner slot (everything but the shared action archive cache).
+# Cache stores of a runner slot (not the shared action archive cache, not the
+# work dir).
 slot_stores() {
-  awk -F'|' 'NF > 3 && $5 !~ /(^|,)shared(,|$)/ && !seen[$1]++ {print $1}' <<<"$STORE_TABLE"
+  awk -F'|' 'NF > 3 && $5 !~ /(^|,)(shared|work)(,|$)/ && !seen[$1]++ {print $1}' <<<"$STORE_TABLE"
 }
 
 dir_bytes() {
@@ -308,7 +331,7 @@ evict_unit() {
 # order evicted the most-used dependencies first). Volumes mounted relatime
 # still refresh atime on the first read after a change.
 lru_entries() {
-  local budget="$1" spec store sd total=0 sz excess freed=0 n=0
+  local budget="$1" spec store sd total=0 sz excess freed=0 n=0 tracked=0 untracked
   local rec key size stop path
   local -A dirs=() touched=()
   shift
@@ -327,7 +350,11 @@ lru_entries() {
   excess=$((total - budget))
   log "${total}B (budget ${budget}B), evicting least recently used entries"
   while IFS= read -r -d '' rec; do
-    if [ "$freed" -ge "$excess" ]; then break; fi
+    # Every unit is read, so that what no rule can evict shows up below.
+    size="${rec#*$'\t'}"
+    size="${size%%$'\t'*}"
+    tracked=$((tracked + ${size:-0}))
+    if [ "$freed" -ge "$excess" ]; then continue; fi
     IFS=$'\t' read -r key size store stop path <<<"$rec"
     if [ -z "$path" ] || [ -z "$size" ]; then continue; fi
     evict_unit "$store" "$stop" "$path"
@@ -351,16 +378,32 @@ lru_entries() {
   else
     log "evicted $n entries, ~${freed}B freed"
   fi
+  # Bytes no STORE_TABLE rule covers still count against the budget, so they
+  # are paid for by evicting what a rule does cover: Gradle 9's untracked
+  # caches/<version>/transforms evicted every dependency (issue #45). A new
+  # tool or cache layout shows up here first.
+  # Not for an idle slot (budget 0): what is left there is what no rule covers.
+  untracked=$((total - tracked))
+  if [ "$budget" -gt 0 ] && [ $((untracked * 4)) -gt "$budget" ]; then
+    log "WARNING: ${untracked}B protected or untracked by STORE_TABLE (more than a quarter of the budget); add a rule if it is cache"
+  fi
 }
 
-# Total cache budget in bytes of one slot, with $1 slots sharing it.
+# Total cache budget in bytes of one slot, with $1 slots sharing it. The
+# maven-proxy cache (docker-compose.yml) shares the host budget: what it holds
+# comes off before the split, but at most half of it, so a proxy cache larger
+# than a small disk's budget never leaves the slots with nothing.
 slot_budget() {
-  local slots="$1" fs total
+  local slots="$1" fs total proxy
   total="$CACHE_BUDGET_BYTES"
   fs=$(df -B1 --output=size "$RUNNER_DATA_DIR" 2>/dev/null | awk 'NR == 2 {print $1}')
   if [ -n "$fs" ] && [ $((fs * CACHE_BUDGET_PCT / 100)) -lt "$total" ]; then
     total=$((fs * CACHE_BUDGET_PCT / 100))
   fi
+  proxy=$(dir_bytes "$RUNNER_DATA_DIR/maven-proxy")
+  proxy=${proxy:-0}
+  [ "$proxy" -le $((total / 2)) ] || proxy=$((total / 2))
+  total=$((total - proxy))
   echo $((total / slots))
 }
 
@@ -371,15 +414,16 @@ free_pct() {
   df -B1 --output=avail,size "$dir" 2>/dev/null | awk 'NR == 2 && $2 > 0 {print int($1 * 100 / $2)}'
 }
 
-# Prune one slot ($1 = slot dir) down to $2 bytes, unless a job is running in
+# Prune one slot ($1 = slot dir) down to $2 bytes of cache and its work dir
+# down to $3 bytes (left alone when $3 is empty), unless a job is running in
 # it. The flock keeps jobs from starting meanwhile: pre-job.sh waits on it.
 prune_slot() {
-  local slot="$1" budget="$2" id start="$SECONDS"
+  local slot="$1" budget="$2" work_budget="${3:-}" id start="$SECONDS"
   id="${slot##*/}"
   (
     flock -n 9 || { log "slot $id: another prune holds the lock; skipping"; exit 0; }
     if [ -e "$slot/busy" ]; then
-      if [ -n "$(find "$slot/busy" -maxdepth 0 -mmin "-$BUSY_STALE_MINUTES" 2>/dev/null)" ]; then
+      if younger_than "$slot/busy" -mmin "-$BUSY_STALE_MINUTES"; then
         log "slot $id: job running (busy marker); skipping"
         exit 0
       fi
@@ -389,18 +433,48 @@ prune_slot() {
     for store in $(slot_stores); do args+=("$store=$slot/cache/$store"); done
     log "slot $id: budget ${budget}B"
     lru_entries "$budget" "${args[@]}"
+    if [ -n "$work_budget" ]; then
+      log "slot $id: work dir budget ${work_budget}B"
+      lru_entries "$work_budget" "work=$slot/work"
+    fi
   ) 9>"$slot/.prune.lock"
   log "slot $id: took $((SECONDS - start))s"
 }
 
+# True when no runner has claimed slot $1 for SLOT_IDLE_DAYS: the preflight
+# touches the .lock of the slot it claims, and an ephemeral runner claims one
+# per job. Slots above the running count go stale, e.g. after RUNNERS went
+# down. A slot without a .lock counts as active, and so does one whose .lock a
+# runner still holds (preflight-entrypoint.sh keeps it locked for the
+# container's life), however long that runner has waited for a job. The probe
+# holds the lock for an instant; a runner starting just then takes the next slot.
+slot_idle() {
+  [ -e "$1/.lock" ] && ! younger_than "$1/.lock" -mtime "-$SLOT_IDLE_DAYS" && flock -n "$1/.lock" true
+}
+
+# Split the budget between the active slots only; an idle slot is emptied, so a
+# shrunk host does not keep a dead slot's share. When every slot looks idle
+# (the whole host was stopped), all of them count as active. The work dir
+# limit is per slot, not shared.
 prune_caches() {
-  local caches=() cache budget
+  local active=() idle=() cache budget work_budget=""
+  [ "$WORK_BUDGET_BYTES" -gt 0 ] 2>/dev/null && work_budget="$WORK_BUDGET_BYTES"
   for cache in "$RUNNER_DATA_DIR"/slots/*/cache; do
-    [ -d "$cache" ] && caches+=("$cache")
+    [ -d "$cache" ] || continue
+    if slot_idle "${cache%/cache}"; then idle+=("$cache"); else active+=("$cache"); fi
   done
-  if [ "${#caches[@]}" -gt 0 ]; then
-    budget=$(slot_budget "${#caches[@]}")
-    for cache in "${caches[@]}"; do prune_slot "${cache%/cache}" "$budget"; done
+  if [ "${#active[@]}" -eq 0 ]; then
+    active=("${idle[@]}")
+    idle=()
+  fi
+  if [ "${#active[@]}" -gt 0 ]; then
+    budget=$(slot_budget "${#active[@]}")
+    for cache in "${active[@]}"; do prune_slot "${cache%/cache}" "$budget" "$work_budget"; done
+    for cache in "${idle[@]}"; do
+      cache="${cache%/cache}"
+      log "slot ${cache##*/}: idle (no runner for ${SLOT_IDLE_DAYS} days), emptying"
+      prune_slot "$cache" 0 "${work_budget:+0}"
+    done
   else
     log "no slots under $RUNNER_DATA_DIR/slots"
   fi

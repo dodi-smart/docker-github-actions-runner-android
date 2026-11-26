@@ -72,6 +72,7 @@ fi
 if [ "$variant" = ndk ]; then
   check "NDK is installed" 'ls -d "$ANDROID_SDK_ROOT"/ndk/*/ >/dev/null'
 fi
+check "maven-proxy init script for the preflight" 'test -s /usr/local/share/github-runner/maven-proxy.gradle'
 for tool in xxd flock jq git ninja rustup-init; do
   check "$tool is on PATH" "command -v $tool"
 done
