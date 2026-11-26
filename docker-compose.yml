@@ -13,8 +13,9 @@
 #                             mise, hk, pub and the hosted tool cache; the
 #                             default home paths (/root/.bun, ...) link here.
 # One slot per running container, so no two concurrent jobs share a cache.
-# The action archive cache is the only shared state: read-only in the
-# runners, filled by the pruner.
+# Shared per host: the action archive cache (read-only in the runners, filled
+# by the pruner) and the maven-proxy, which every slot's Gradle resolves Maven
+# Central, Google Maven and the Plugin Portal through.
 x-runner-env: &runner-env
   APP_ID: ${APP_ID}
   APP_PRIVATE_KEY: ${APP_PRIVATE_KEY}
@@ -43,6 +44,11 @@ x-runner-env: &runner-env
   # downloads, and only reads: the `pruner` service fills the shared
   # runner-action-cache volume (see pruner.sh), mounted read-only below.
   ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE: /opt/actionarchivecache
+  # Read by the Gradle init script the preflight installs: Gradle resolves
+  # through the maven-proxy service below (README "Maven proxy"). `off` here or
+  # in a job's env sends it upstream.
+  MAVEN_PROXY: ${MAVEN_PROXY:-on}
+  MAVEN_PROXY_URL: http://maven-proxy:8080
 
 x-runner: &runner
   image: ${RUNNER_IMAGE:-ghcr.io/dodi-smart/github-runner}
@@ -123,6 +129,30 @@ services:
       - runner-action-cache:/opt/actionarchivecache
     security_opt:
       - label:disable
+
+  # Caching proxy for Maven repositories (maven-proxy/default.conf.template):
+  # the host fetches each artifact once, concurrent misses for one file wait
+  # for a single download, and the cache is LRU-bounded by
+  # MAVEN_PROXY_MAX_SIZE. Runners do not depend on it: when it is down or
+  # scaled to 0 (`docker compose up -d --scale maven-proxy=0`), Gradle goes
+  # upstream. Only the compose network reaches it; no port is published.
+  maven-proxy:
+    image: nginx:1.31.9-alpine
+    restart: unless-stopped
+    environment:
+      NGINX_ENVSUBST_FILTER: ^(MAVEN_CENTRAL_URL|GOOGLE_MAVEN_URL|GRADLE_PLUGIN_PORTAL_URL|MAVEN_PROXY_MAX_SIZE)$$
+      MAVEN_CENTRAL_URL: ${MAVEN_CENTRAL_URL:-https://repo.maven.apache.org/maven2}
+      GOOGLE_MAVEN_URL: ${GOOGLE_MAVEN_URL:-https://dl.google.com/dl/android/maven2}
+      GRADLE_PLUGIN_PORTAL_URL: ${GRADLE_PLUGIN_PORTAL_URL:-https://plugins.gradle.org/m2}
+      MAVEN_PROXY_MAX_SIZE: ${MAVEN_PROXY_MAX_SIZE:-20g}
+    volumes:
+      - ./maven-proxy/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ${RUNNER_DATA_DIR:-/var/lib/github-runner}/maven-proxy:/var/cache/maven-proxy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   runner-action-cache: {} # read-only in runners, filled by the pruner

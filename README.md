@@ -32,7 +32,9 @@ and adds:
   at the same path on the host and in the runner;
 - **a pruner** that keeps every cache within a disk budget sized to the
   machine, without touching a cache while a job is using it;
-- **a local action archive cache** that avoids GitHub's download rate limits.
+- **a local action archive cache** that avoids GitHub's download rate limits;
+- **a host-wide Maven proxy**, so a host downloads each Maven Central, Google
+  Maven and Gradle Plugin Portal artifact once, not once per runner.
 
 ## Contents
 
@@ -44,6 +46,7 @@ and adds:
 - [Caches](#caches)
 - [Maintenance](#maintenance)
 - [Action archive cache](#action-archive-cache)
+- [Maven proxy](#maven-proxy)
 - [Configuration reference](#configuration-reference)
 - [Troubleshooting](#troubleshooting)
 - [Upgrading from named volumes](#upgrading-from-named-volumes)
@@ -245,7 +248,7 @@ Each slot keeps one directory per tool under `slots/<n>/cache/`:
 | bun | `~/.bun` | whole packages; never `bin/` |
 | npm | `~/.npm` | files (content-addressed) |
 | pnpm | `~/.local/share/pnpm`, `~/.cache/pnpm` | the whole store |
-| gradle | `~/.gradle` | whole dependency versions, transforms, wrapper dists |
+| gradle | `~/.gradle` | whole dependency versions, transforms (Gradle 8 `caches/transforms-*`, Gradle 9 `caches/<version>/transforms`), wrapper dists |
 | cargo | `~/.cargo` | crates, unpacked sources, git checkouts; never `bin/` |
 | rustup | `~/.rustup` | whole toolchains; never the default. rustup itself is set up in `~/.cargo` on first start |
 | konan | `~/.konan` | whole dependencies and prebuilt compilers |
@@ -264,8 +267,15 @@ path:
 
 - **Cache budget.** Each host gets `CACHE_BUDGET_BYTES` (default 60 GiB) or
   `CACHE_BUDGET_PCT` of the data disk (default 40 %), whichever is smaller,
-  split evenly across the slots. Within a slot, least recently used entries
-  go first, across all stores.
+  split evenly across the active slots. Within a slot, least recently used
+  entries go first, across all stores. A slot no runner has claimed for
+  `SLOT_IDLE_DAYS` (default 7), such as slot 6 after `RUNNERS` went from 6 to
+  5, takes no share and is emptied.
+- **Work dir limit.** Each slot keeps a checkout of every repo it has built
+  in `work/<repo>`. Past `WORK_BUDGET_BYTES` per slot (default 10 GiB; `0`
+  turns it off), the checkouts used least recently go whole; the next job of
+  that repo clones it again. The runner's own `work/_*` dirs stay. An idle
+  slot loses all its checkouts.
 - **Never under a running job.** A slot whose runner is in a job is skipped.
   A job that starts while the pruner works on its slot waits for it, up to
   `PRUNE_WAIT_SECONDS`.
@@ -317,6 +327,66 @@ docker compose run --rm pruner prefetch
 To confirm it works, re-run a job with debug logging. "Set up job" then shows
 `Copied action archive '/opt/actionarchivecache/...'`.
 
+## Maven proxy
+
+Every runner slot keeps its own Gradle cache, and the pruner evicts from those
+caches. Without a shared layer, a host downloads the same jars again for each
+slot and after each eviction. Maven Central limits downloads of large files
+per IP and per file, so Robolectric's 150–190 MB jars got a host blocked for
+about a day
+([#45](https://github.com/dodi-smart/docker-github-actions-runner-android/issues/45)).
+
+The `maven-proxy` service is an nginx caching proxy
+([`maven-proxy/default.conf.template`](maven-proxy/default.conf.template)) that
+every slot on the host resolves through:
+
+- **One download per host.** A cached artifact is served locally, whichever
+  slot asks for it. When several slots miss the same file at once, they wait
+  for a single upstream download (`proxy_cache_lock`).
+- **Gradle uses it without workflow changes.** The preflight installs
+  [`maven-proxy.gradle`](maven-proxy/maven-proxy.gradle) into each slot's
+  `~/.gradle/init.d`. The script redirects every repository whose URL is
+  Maven Central (`mavenCentral()`), Google Maven (`google()`) or the Plugin
+  Portal (`gradlePluginPortal()`, and the implicit portal for project plugins)
+  to the proxy. Other repositories stay as declared. Test tasks also get
+  `robolectric.dependency.repo.url`, so the `android-all` jars that Robolectric
+  downloads at test time come through the proxy too.
+- **It falls back to upstream when a build starts.** The script probes the
+  proxy at the start of each build. If the proxy does not answer, the build
+  uses the upstream repositories as declared and logs
+  `maven-proxy: … does not answer; using the upstream repositories`. A proxy
+  that goes away during a build fails that build's downloads, so recreate
+  `maven-proxy` (an nginx bump, for example) while the runners are idle, as
+  with the runners themselves.
+- **It is bounded.** The cache lives in `RUNNER_DATA_DIR/maven-proxy`, outside
+  the slots; what it holds, up to half of the pruner's host budget, comes off
+  that budget before it is split across the slots. nginx evicts the least recently used
+  entries above `MAVEN_PROXY_MAX_SIZE` (default 20 GB), and anything unused
+  for 90 days. A 404 is cached for 10 minutes and `maven-metadata.xml` for 10
+  minutes. Errors such as `429` are never cached.
+- **It is private to the host.** Only the Compose network reaches it; no port
+  is published.
+
+To turn it off:
+
+- **On a host:** set `MAVEN_PROXY=off` in `.env` and run
+  `docker compose up -d`. The init script then leaves every build as
+  declared, and the proxy container can be stopped with
+  `docker compose up -d --scale maven-proxy=0`.
+- **For one job:** set `MAVEN_PROXY: off` in the job's `env`.
+
+To check that it works, look for `cache=HIT` in its log, or ask it from a
+runner:
+
+```bash
+docker compose logs maven-proxy | tail
+docker compose exec runner curl -sI http://maven-proxy:8080/maven2/junit/junit/4.13.2/junit-4.13.2.pom | grep -i x-cache-status
+```
+
+To empty the cache, run `docker compose down maven-proxy`, delete
+`RUNNER_DATA_DIR/maven-proxy` (it belongs to nginx, so use `sudo`), then run
+`docker compose up -d`.
+
 ## Configuration reference
 
 Set these in `.env`. [`.env.example`](.env.example) has them all, with
@@ -335,10 +405,15 @@ comments.
 | `RUNNER_IMAGE` | `ghcr.io/dodi-smart/github-runner` | image or tag (e.g. `:slim`) |
 | `RUNNER_NAME_PREFIX`, `RUNNER_GROUP` | `runner`, `Default` | runner name and group |
 | `CACHE_BUDGET_BYTES`, `CACHE_BUDGET_PCT` | 60 GiB, `40` | pruner cache budget per host |
+| `SLOT_IDLE_DAYS` | `7` | days without a runner before a slot is idle: no budget share, caches and work dir emptied |
+| `WORK_BUDGET_BYTES` | 10 GiB | work dir limit per slot; repo checkouts used least recently go first (`0` = no limit) |
 | `PRUNE_FREE_PCT`, `PRUNE_INTERVAL_SECONDS` | `5`, `86400` | when the pruner runs |
 | `DOCKER_PRUNE_KEEP_LABELS` | empty | space-separated `key` or `key=value`: images and stopped containers the pruner keeps, plus the image of a kept container |
 | `DOCKER_PRUNE_KEEP_IMAGES` | empty | space-separated name patterns, e.g. `variscite:* ghcr.io/acme/*`, for images you cannot label |
 | `PREFETCH_SOURCES`, `PREFETCH_EXTRA` | — | action archive cache sources |
+| `MAVEN_PROXY` | `on` | `off` makes Gradle resolve upstream directly (see [Maven proxy](#maven-proxy)) |
+| `MAVEN_PROXY_MAX_SIZE` | `20g` | size limit of the proxy's cache |
+| `MAVEN_CENTRAL_URL`, `GOOGLE_MAVEN_URL`, `GRADLE_PLUGIN_PORTAL_URL` | the public repositories | what the proxy fetches from, e.g. a closer mirror |
 | `DISABLE_AUTO_UPDATE` | empty | any non-empty value (even `false`) disables runner self-update |
 
 `EPHEMERAL` and `DISABLE_AUTO_UPDATE` count as set for any non-empty value,
@@ -358,6 +433,11 @@ because the upstream entrypoint only checks whether they are empty.
 - **A job fails with a corrupt cache.** Stop that slot's runner, delete the
   store (`rm -rf $RUNNER_DATA_DIR/slots/<n>/cache/<store>`) and start it
   again. It refills on the next job.
+- **Gradle still downloads from Maven Central.** Check that the job log has no
+  `maven-proxy: … does not answer` line, that the repository is one of the
+  three the proxy covers, and that the job does not move `GRADLE_USER_HOME`.
+  The init script lives in `~/.gradle/init.d`, so a different user home skips
+  it.
 - **Don't put `RUNNER_DATA_DIR` on NFS.** Slot locks use `flock`, which needs
   a local filesystem.
 

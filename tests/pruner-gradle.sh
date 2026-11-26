@@ -17,6 +17,11 @@ mkunit "$fs/org.old/lib/1.1.0/h2" 100000 2       # newer version of the same mod
 mkunit "$fs/org.fresh/app/2.0.0/h3" 100000 1
 mkunit "$g/caches/transforms-4/oldhash" 100000 80
 mkunit "$g/caches/transforms-4/freshhash" 100000 1
+# Gradle 9 keeps transforms per Gradle version: caches/<version>/transforms.
+# The rest of caches/<version> (kotlin-dsl, fileHashes, ...) is Gradle's own.
+mkunit "$g/caches/9.8.2/transforms/oldhash" 100000 85
+mkunit "$g/caches/9.8.2/transforms/freshhash" 100000 1
+mkfile "$g/caches/9.8.2/kotlin-dsl/accessors.bin" 50000 300
 mkunit "$g/wrapper/dists/gradle-7.0-bin/abc" 100000 70
 mkunit "$g/wrapper/dists/gradle-8.5-bin/def" 100000 1
 mkunit "$g/caches/jars-9/oldjars" 100000 60
@@ -27,11 +32,15 @@ echo meta >"$g/caches/modules-2/metadata-2.107/descriptors.bin"
 touch -a -d '500 days ago' "$g/caches/modules-2/metadata-2.107/descriptors.bin"
 
 CACHE_BUDGET_BYTES=$(budget_without "$cache0" "$fs/org.old/lib/1.0.0" "$g/caches/transforms-4/oldhash" \
-  "$g/wrapper/dists/gradle-7.0-bin" "$g/caches/jars-9/oldjars" "$g/caches/build-cache-1/oldentry")
+  "$g/caches/9.8.2/transforms/oldhash" "$g/wrapper/dists/gradle-7.0-bin" "$g/caches/jars-9/oldjars" \
+  "$g/caches/build-cache-1/oldentry")
 prune_caches >/dev/null
 
 gone "$fs/org.old/lib/1.0.0"
 gone "$g/caches/transforms-4/oldhash"
+gone "$g/caches/9.8.2/transforms/oldhash"
+kept "$g/caches/9.8.2/transforms/freshhash/data.bin"
+kept "$g/caches/9.8.2/kotlin-dsl/accessors.bin"
 gone "$g/wrapper/dists/gradle-7.0-bin"
 gone "$g/caches/jars-9/oldjars"
 gone "$g/caches/build-cache-1/oldentry"
@@ -47,5 +56,11 @@ kept "$g/caches/modules-2/metadata-2.107/descriptors.bin"
 
 size=$(stores_bytes "$cache0")
 [ "$size" -le "$CACHE_BUDGET_BYTES" ] || fail "slot ${size}B still over the ${CACHE_BUDGET_BYTES}B budget"
+
+# Bytes no rule covers are reported once they pass a quarter of the budget.
+mkfile "$g/caches/10.0/unknown-layout/blob" 400000 1
+CACHE_BUDGET_BYTES=$(( $(stores_bytes "$cache0") - 1 ))
+out=$(prune_caches)
+grep -q "WARNING: .* untracked by STORE_TABLE" <<<"$out" || fail "untracked bytes not reported: $out"
 
 finish "gradle evicted whole versions, metadata untouched"
